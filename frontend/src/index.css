@@ -1,0 +1,57 @@
+/* The few global resets the app relied on from the Tailwind preflight it used
+   to load (MUI's CssBaseline covers the rest). */
+*,
+::before,
+::after {
+  border-width: 0;
+  border-style: solid;
+}
+img,
+video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.custom-fullscreen-active video {
+  max-height: 100vh !important; /* Or max-height: none !important; */
+}
+
+.my-masonry-grid {
+  display: -webkit-box; 
+  display: -ms-flexbox; 
+  display: flex;
+  width: auto;
+}
+.my-masonry-grid_column {
+  padding-left: 16px; 
+  background-clip: padding-box;
+}
+
+
+.my-masonry-grid_column > div {
+  margin-bottom: 16px;
+}
+
+/* CARTO's free raster basemaps now require an API key, so dark mode fakes a
+   dark map by inverting the plain OpenStreetMap tiles instead. Scoped to the
+   tile pane only so markers/popups/clusters keep their normal colors. */
+.map-dark-tiles .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9);
+}
+
+.custom-marker-cluster {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 40px;
+  height: 40px;
+  background-color: var(--color-primary);
+  border-radius: 50%;
+  border: 2px solid var(--color-paper);
+  box-shadow: 0 0 5px var(--overlay-active);
+  color: var(--color-paper);
+  font-weight: bold;
+  font-size: 14px;
+  line-height: 1;
+}

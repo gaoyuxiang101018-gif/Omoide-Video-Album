@@ -1,0 +1,3 @@
+# Colour transform assets and references have published byte-level hashes.
+*.cube -text
+*.ctl -text

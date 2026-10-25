@@ -1,0 +1,435 @@
+"""PyInstaller binary entry point.
+
+Shows the loading window immediately after the binary is clicked, then
+imports the full application stack (FastAPI, SQLAlchemy, all routers, …)
+in the background thread that pywebview already provides.
+
+Only `webview` and the Python standard library are imported before
+`webview.create_window()` is called.  Everything else is deferred to
+`_boot_and_switch()`, which runs while the spinner is already visible.
+"""
+
+from __future__ import annotations
+
+import logging
+import multiprocessing
+import os
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+# Windows multiprocessing re-launches the frozen executable for worker
+# processes. Without this guard, a worker starts this GUI entry point again,
+# creating a second Uvicorn/WebView instance and leaving the original window
+# blank or attached to the wrong server.
+multiprocessing.freeze_support()
+
+
+# ---------------------------------------------------------------------------
+# Helpers — pure stdlib, no heavy imports
+# ---------------------------------------------------------------------------
+
+
+def _env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_webview2_runtime_dir() -> Path | None:
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "webview2runtime")
+    try:
+        candidates.append(
+            Path(sys.executable).resolve().parent / "webview2runtime"
+        )
+    except Exception:
+        pass
+    try:
+        candidates.append(
+            Path(__file__).resolve().parent.parent / "webview2runtime"
+        )
+    except Exception:
+        pass
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _bundle_base() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent
+
+
+def _webview_storage_dir() -> Path:
+    """OS-specific persistent storage dir for the webview (cookies, localStorage).
+
+    Mirrors app.config.get_os_app_config_dir(), reimplemented with pure
+    stdlib since this module must not import app.config before the window
+    is created.
+    """
+    if sys.platform == "win32":
+        base = Path(
+            os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming"
+        )
+    elif sys.platform == "darwin":
+        base = Path(
+            os.getenv("XDG_CONFIG_HOME")
+            or Path.home() / "Library" / "Application Support"
+        )
+    else:
+        base = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
+    d = base / "omoide" / "webview"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _boot_log_path() -> Path:
+    # Keep early native-launch diagnostics alongside the normal application
+    # log, rather than in the application-data root.
+    log_dir = _webview_storage_dir().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "boot.log"
+
+
+def _boot_log(msg: str) -> None:
+    """Append a timestamped breadcrumb to boot.log.
+
+    Diagnostic only, for tracing where the frozen binary gets stuck before
+    startup — before app.main is imported there is no other durable log
+    sink (stdout is discarded in a windowed build), so this writes directly
+    to a file using pure stdlib.
+    """
+    try:
+        with open(_boot_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# sqlite-vec env var — must be set before app.database is first imported
+# ---------------------------------------------------------------------------
+
+try:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        _base = Path(sys._MEIPASS)
+        _vec_candidates: list[Path] = []
+        for _pat in ("vec0*.dll", "vec0*.so", "vec0*.dylib"):
+            try:
+                _vec_candidates += list(_base.glob(_pat))
+            except Exception:
+                pass
+        if _vec_candidates:
+            os.environ["SQLITE_VEC_PATH"] = str(_vec_candidates[0])
+        else:
+            _vec_name = (
+                "vec0.dll"
+                if sys.platform in ("win32", "cygwin")
+                else "vec0.dylib"
+                if sys.platform == "darwin"
+                else "vec0.so"
+            )
+            os.environ["SQLITE_VEC_PATH"] = str(_base / _vec_name)
+except Exception:
+    pass
+
+_boot_log("launcher: starting (frozen=%s)" % getattr(sys, "frozen", False))
+
+# ---------------------------------------------------------------------------
+# WebView environment — must be set before `import webview`
+# ---------------------------------------------------------------------------
+
+os.environ["QT_API"] = "pyside6"
+_webview_gui_override = os.environ.get("OMOIDE_WEBVIEW_GUI")
+_webview2_runtime_path: str | None = None
+if sys.platform.startswith("win"):
+    _gui_choice = (_webview_gui_override or "edgechromium").strip().lower()
+    if _gui_choice == "edgechromium" and _env_truthy(
+        os.environ.get("OMOIDE_USE_BUNDLED_WEBVIEW2")
+    ):
+        _wv2_dir = _resolve_webview2_runtime_dir()
+        if _wv2_dir:
+            # An explicitly requested fixed runtime is configured through
+            # pywebview's supported EdgeChromium setting. By default the
+            # packaged app uses the system Evergreen runtime, matching local
+            # builds and avoiding CI's fixed-runtime incompatibilities.
+            _webview2_runtime_path = str(_wv2_dir)
+            _boot_log(
+                f"launcher: using bundled WebView2 runtime at {_wv2_dir}"
+            )
+        else:
+            _boot_log(
+                "launcher: no bundled WebView2 runtime found, "
+                "falling back to the system-installed Evergreen runtime"
+            )
+    elif _gui_choice == "edgechromium":
+        _boot_log("launcher: using system-installed Evergreen WebView2 runtime")
+    _disable_gpu_raw = os.environ.get("OMOIDE_WEBVIEW_DISABLE_GPU")
+    _disable_gpu = _disable_gpu_raw is None or _env_truthy(_disable_gpu_raw)
+    if _gui_choice == "qt" and _disable_gpu:
+        _flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        _extra = "--disable-gpu --disable-gpu-compositing --disable-gpu-rasterization"
+        if _extra not in _flags:
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                f"{_flags} {_extra}".strip()
+            )
+
+# ---------------------------------------------------------------------------
+# Now import webview — fast, no ML or ORM involved
+# ---------------------------------------------------------------------------
+
+import webview
+
+if _webview2_runtime_path:
+    webview.settings["WEBVIEW2_RUNTIME_PATH"] = _webview2_runtime_path
+
+# pywebview logs its own errors (e.g. a WebView2/CoreWebView2 init failure)
+# via logging.getLogger('pywebview'), which by default has no handler and no
+# console to fall back to in a windowed build — the message would otherwise
+# vanish. Route it into the same boot.log so a native init failure/hang is
+# still visible.
+try:
+    _pywebview_handler = logging.FileHandler(
+        _boot_log_path(), encoding="utf-8"
+    )
+    _pywebview_handler.setFormatter(
+        logging.Formatter("%(asctime)s pywebview %(levelname)s %(message)s")
+    )
+    _pywebview_logger = logging.getLogger("pywebview")
+    _pywebview_logger.addHandler(_pywebview_handler)
+    _pywebview_logger.setLevel(logging.DEBUG)
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+# Loading screen
+# ---------------------------------------------------------------------------
+
+_LOADING_HTML = """
+<html>
+  <head>
+    <meta charset='utf-8' />
+    <title>omoide</title>
+    <style>
+      body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0b0c; color:#e6e6e6; }
+      .wrap { height:100vh; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; }
+      .spinner { width:48px; height:48px; border:4px solid #2d2f36; border-top-color:#6aa3ff; border-radius:50%; animation:spin 1s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .sub { color:#9aa0a6; font-size:14px; }
+    </style>
+  </head>
+  <body>
+    <div class='wrap'>
+      <div class='spinner'></div>
+      <div>Starting omoide…</div>
+      <div class='sub'>Preparing database and services</div>
+    </div>
+  </body>
+</html>
+"""
+
+
+def _preferred_webview_gui() -> str | None:
+    override = os.environ.get("OMOIDE_WEBVIEW_GUI")
+    if override:
+        return override.strip().lower()
+    if sys.platform.startswith("win"):
+        return "edgechromium"
+    return None
+
+
+def _resolve_window_icon() -> str | None:
+    base = _bundle_base()
+    if sys.platform.startswith("win"):
+        candidates = [
+            "dist/brand/favicon.ico",
+            "frontend/public/brand/favicon.ico",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            "dist/brand/favicon.icns",
+            "frontend/public/brand/favicon.icns",
+            "dist/brand/favicon.ico",
+            "frontend/public/brand/favicon.ico",
+        ]
+    else:
+        candidates = [
+            "dist/brand/app-icon.png",
+            "frontend/public/brand/app-icon.png",
+            "dist/brand/favicon.ico",
+            "frontend/public/brand/favicon.ico",
+        ]
+    for rel in candidates:
+        p = base / rel
+        if p.exists():
+            return os.fspath(p)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Create window — happens immediately, no heavy code has run yet
+# ---------------------------------------------------------------------------
+
+_boot_log("launcher: creating loading window...")
+_window = webview.create_window(
+    "omoide",
+    html=_LOADING_HTML,
+    width=1280,
+    height=720,
+)
+_boot_log("launcher: loading window created")
+
+
+def _shutdown() -> None:
+    # app.main may not be fully imported yet if the window is closed early.
+    _main = sys.modules.get("app.main")
+    if _main and getattr(_main, "server", None):
+        _main.server.should_exit = True
+        time.sleep(1)
+
+
+def _show_boot_error(exc: BaseException) -> None:
+    """Replace the endless spinner with the error and where to find details."""
+    import html
+
+    message = html.escape(f"{type(exc).__name__}: {exc}")
+    log_path = html.escape(os.fspath(_boot_log_path()))
+    try:
+        _window.load_html(
+            "<html><body style=\"font-family:sans-serif;background:#111;"
+            "color:#eee;padding:32px\">"
+            "<h2>omoide failed to start</h2>"
+            f"<pre style=\"white-space:pre-wrap;color:#f88\">{message}</pre>"
+            f"<p>The full error is in <code>{log_path}</code>.</p>"
+            "</body></html>"
+        )
+    except Exception as show_exc:
+        _boot_log(f"boot: could not show the error page: {show_exc}")
+
+
+def _boot_and_switch() -> None:
+    """Runs in the pywebview background thread while the spinner is visible.
+
+    An exception here would otherwise die with the thread: stderr is
+    discarded in the windowed build and the spinner would never go away.
+    """
+    try:
+        _boot()
+    except BaseException as exc:
+        import traceback
+
+        _boot_log("boot: FAILED\n" + traceback.format_exc())
+        _show_boot_error(exc)
+
+
+def _boot() -> None:
+    """Imports the full application stack, runs migrations, starts the HTTP
+    server, then switches the window to the running app."""
+    _boot_log("boot: background thread started")
+
+    # This single import triggers the full app initialisation:
+    # FastAPI, SQLAlchemy, all routers, settings load, etc.
+    _boot_log(
+        "boot: importing app.main (FastAPI, SQLAlchemy, routers, settings)..."
+    )
+    import app.main as _main
+
+    _boot_log("boot: app.main imported")
+
+    _boot_log("boot: running database migrations...")
+    try:
+        _main.run_migrations()
+        _boot_log("boot: migrations complete")
+    except Exception as exc:
+        _boot_log(f"boot: migrations warning: {exc}")
+
+    _boot_log("boot: starting uvicorn server thread...")
+    server_thread = threading.Thread(target=_main.run_server, daemon=True)
+    server_thread.start()
+
+    host, port = "127.0.0.1", 8123
+    _boot_log(f"boot: polling {host}:{port} for up to 120s...")
+    start = time.time()
+    deadline = start + 120
+    connected = False
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                connected = True
+                break
+        except OSError:
+            time.sleep(0.25)
+
+    if connected:
+        _boot_log(
+            f"boot: {host}:{port} answered after {time.time() - start:.1f}s"
+        )
+    else:
+        _boot_log(
+            f"boot: gave up waiting for {host}:{port} after "
+            f"{time.time() - start:.1f}s — server never answered"
+        )
+
+    _boot_log("boot: navigating window to app url...")
+    try:
+        _window.load_url(f"http://{host}:{port}")
+        _boot_log("boot: navigation call returned")
+    except Exception as exc:
+        _boot_log(f"boot: navigation failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Register shutdown handler and enter the GUI event loop
+# ---------------------------------------------------------------------------
+
+_window.events.closed += _shutdown
+_preferred_gui = _preferred_webview_gui()
+_webview_storage_path = os.fspath(_webview_storage_dir())
+_boot_log(
+    f"launcher: entering GUI event loop (gui={_preferred_gui!r}, "
+    f"storage_path={_webview_storage_path})"
+)
+try:
+    if _preferred_gui:
+        webview.start(
+            _boot_and_switch,
+            gui=_preferred_gui,
+            icon=_resolve_window_icon(),
+            private_mode=False,
+            storage_path=_webview_storage_path,
+        )
+    else:
+        webview.start(
+            _boot_and_switch,
+            icon=_resolve_window_icon(),
+            private_mode=False,
+            storage_path=_webview_storage_path,
+        )
+except RuntimeError as exc:
+    _boot_log(f"launcher: webview.start() raised RuntimeError: {exc}")
+    if sys.platform.startswith("win"):
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            (
+                f"Failed to initialize the application window.\n\n"
+                f"Error: {exc}\n\n"
+                "A likely cause is that Windows blocked the DLLs when "
+                "the archive was extracted.  Try the following:\n\n"
+                "  1. Open PowerShell in the application folder and run:\n"
+                "       Get-ChildItem -Recurse | Unblock-File\n"
+                "  2. Then launch the application again.\n\n"
+                "If the problem persists, please report it at:\n"
+                "https://github.com/einaeffchen/omoide/issues"
+            ),
+            "Omoide – Startup Error",
+            0x10,
+        )
+    sys.exit(1)

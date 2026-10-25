@@ -1,0 +1,238 @@
+import numpy as np
+from cv2.typing import MatLike
+from PIL import Image
+from sqlalchemy import text
+from sqlmodel import select
+
+from app.clip_onnx import get_clip_encoder
+from app.config import settings
+from app.logger import logger
+from app.models import Media, Scene, Tag
+from app.processors.base import MediaProcessor
+from app.database import safe_commit
+from app.frames import PhotoScene
+from app.vectors import vector_from_stored, vector_to_blob
+
+
+class EmbeddingExtractor(MediaProcessor):
+    name = "embedding_extractor"
+    order = 10
+
+    def load_model(self):
+        if settings.processors.image_embedding_processor_active:
+            self.active = True
+            # Use shared CLIP encoder; keep it warm to avoid repeated init
+            self._clip = get_clip_encoder()
+
+    def unload(self):
+        self._clip = None
+
+    def _get_embeddings_batch(self, images: list) -> list[np.ndarray | None]:
+        """Run CLIP encode_image on a batch of raw images in sub-batches.
+
+        Accepts PIL images or numpy RGB arrays. Returns a list of float32
+        embeddings (or None for any image that failed preprocessing).
+        """
+        batch_size = max(1, getattr(settings.processors, "embedding_batch_size", 16))
+        results: list[np.ndarray | None] = [None] * len(images)
+
+        for chunk_start in range(0, len(images), batch_size):
+            chunk = images[chunk_start : chunk_start + batch_size]
+            preprocessed: list[np.ndarray] = []
+            valid_in_chunk: list[int] = []
+
+            for i, img in enumerate(chunk):
+                try:
+                    preprocessed.append(self._clip.preprocess(img))
+                    valid_in_chunk.append(i)
+                except OSError as e:
+                    logger.error(
+                        "EmbeddingExtractor: failed to preprocess image: %s", e
+                    )
+
+            if not preprocessed:
+                continue
+
+            features_np = self._clip.encode_pixels(np.stack(preprocessed))
+
+            for feat_i, chunk_i in enumerate(valid_in_chunk):
+                results[chunk_start + chunk_i] = features_np[feat_i]
+
+        return results
+
+    def process(
+        self,
+        media: Media,
+        session,
+        scenes: list[tuple[Scene, MatLike]] | list[PhotoScene] | list[Scene],
+    ):
+        # 1) skip if already extracted
+        if session.exec(
+            select(Media).where(
+                Media.embeddings_created.is_(True), Media.id == media.id
+            )
+        ).first():
+            return True
+
+        embeddings: list[np.ndarray] = []
+
+        # Fast path: scenes are already-stored Scene DB objects — load from DB
+        if scenes and isinstance(scenes[0], Scene):
+            for scene in scenes:
+                row = session.exec(
+                    text(
+                        "SELECT embedding FROM scene_embeddings WHERE scene_id = :sid"
+                    ).bindparams(sid=scene.id)
+                ).first()
+                if not row:
+                    # Scene has no stored embedding yet (e.g. manually created scene).
+                    # Compute from thumbnail if available.
+                    if scene.thumbnail_path and hasattr(self, "_clip"):
+                        try:
+                            thumb = settings.general.thumb_dir / scene.thumbnail_path
+                            img = Image.open(thumb).convert("RGB")
+                            result = self._get_embeddings_batch([img])
+                            embedding = result[0] if result else None
+                            if embedding is not None:
+                                embeddings.append(embedding)
+                                blob = vector_to_blob(embedding)
+                                if blob:
+                                    session.exec(
+                                        text(
+                                            "INSERT OR REPLACE INTO scene_embeddings"
+                                            "(scene_id, media_id, embedding)"
+                                            " VALUES (:sid, :mid, :emb)"
+                                        ).bindparams(sid=scene.id, mid=media.id, emb=blob)
+                                    )
+                        except Exception:
+                            logger.warning(
+                                "EmbeddingExtractor: failed to compute embedding for scene %s",
+                                scene.id,
+                            )
+                    else:
+                        logger.debug(
+                            "EmbeddingExtractor: no stored embedding for scene %s; skipping",
+                            scene.id,
+                        )
+                    continue
+                vec = vector_from_stored(row[0])
+                if vec is None or vec.size == 0:
+                    logger.debug(
+                        "EmbeddingExtractor: invalid stored embedding for scene %s; skipping",
+                        scene.id,
+                    )
+                    continue
+                embeddings.append(vec.astype(np.float32, copy=False))
+        else:
+            # Collect all raw images and their associated Scene objects (if any)
+            # then run a single batched CLIP forward pass.
+            raw_images: list = []
+            scene_objects: list[Scene | None] = []
+            for scene in scenes:
+                if isinstance(scene, PhotoScene):
+                    raw_images.append(scene.rgb)
+                    scene_objects.append(None)
+                elif isinstance(scene, tuple):
+                    scene_obj, frame = scene
+                    raw_images.append(frame)
+                    scene_objects.append(scene_obj)
+                else:
+                    logger.warning(
+                        "EmbeddingExtractor: unexpected scene type %s for %s",
+                        type(scene),
+                        media.path,
+                    )
+
+            if raw_images:
+                batch_results = self._get_embeddings_batch(raw_images)
+
+                for scene_obj, embedding in zip(scene_objects, batch_results):
+                    if embedding is None:
+                        logger.error(
+                            "EmbeddingExtractor: model returned empty embedding for %s",
+                            media.path,
+                        )
+                        media.processing_error = (
+                            "Embedding extraction failed: the model returned"
+                            " no embedding for a scene frame."
+                        )
+                        session.add(media)
+                        return False
+
+                    embeddings.append(embedding)
+
+                    if scene_obj is not None:
+                        session.add(scene_obj)
+                        session.flush()
+                        blob = vector_to_blob(embedding)
+                        if blob is None:
+                            logger.error(
+                                "EmbeddingExtractor: failed to encode scene embedding"
+                                " for scene %s in media %s",
+                                scene_obj.id,
+                                media.path,
+                            )
+                        else:
+                            session.exec(
+                                text(
+                                    """
+                                    INSERT OR REPLACE INTO scene_embeddings(scene_id, media_id, embedding)
+                                    VALUES (:sid, :mid, :emb)
+                                    """
+                                ).bindparams(
+                                    sid=scene_obj.id, mid=media.id, emb=blob
+                                )
+                            )
+
+        if not embeddings:
+            logger.warning(
+                "EmbeddingExtractor: no embeddings produced for %s", media.path
+            )
+            return True
+
+        if media.duration is None:  # is photo/picture
+            vec_embedding = embeddings[0]
+        else:
+            arr = np.stack([np.array(e, dtype=np.float32) for e in embeddings])
+            avg = arr.mean(axis=0)
+            norm = np.linalg.norm(avg)
+            if norm > 0:
+                avg /= norm
+            vec_embedding = avg
+
+        media.embeddings_created = True
+        session.add(media)
+        blob = vector_to_blob(vec_embedding)
+        if blob is None:
+            logger.error(
+                "EmbeddingExtractor: failed to convert embedding for %s", media.path
+            )
+            return False
+        # sqlite-vec tables reject INSERT OR REPLACE for an existing key, which
+        # every re-run of this processor hits; drop the old vector first.
+        session.exec(
+            text("DELETE FROM media_embeddings WHERE media_id = :id").bindparams(
+                id=media.id
+            )
+        )
+        sql = text(
+            """
+            INSERT INTO media_embeddings(media_id, embedding)
+            VALUES (:id, :emb)
+            """
+        ).bindparams(id=media.id, emb=blob)
+        session.exec(sql)
+        safe_commit(session)
+        return True
+
+    def get_results(self, media_id: int, session):
+        return session.exec(
+            select(Tag).join(Tag.media).where(Media.id == media_id)
+        ).first()
+
+    def get_pending_condition(self):
+        return Media.embeddings_created == False  # noqa: E712
+
+    def reset_for_media(self, media: Media, session) -> None:
+        media.embeddings_created = False
+        session.add(media)

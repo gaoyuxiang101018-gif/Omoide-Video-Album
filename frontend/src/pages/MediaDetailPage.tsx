@@ -1,0 +1,610 @@
+import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
+import {
+  Container,
+  Box,
+  Dialog,
+  DialogContent,
+  Typography,
+  Button,
+  CircularProgress,
+  Snackbar,
+  LinearProgress,
+  Alert,
+  IconButton,
+  useTheme,
+  useMediaQuery,
+} from "@mui/material";
+import { ArrowBackIosNew, ArrowForwardIos } from "@mui/icons-material";
+import CloseIcon from "@mui/icons-material/Close";
+
+import { useListStore } from "../stores/useListStore";
+import { useCachedList } from "../hooks/usePagedList";
+import { useTaskCompletionVersion } from "../TaskEventsContext";
+
+import { ActionDialogs } from "../components/ActionDialogs";
+import { MediaDisplay } from "../components/MediaDisplay";
+import { MediaHeader } from "../components/MediaHeader";
+import { MediaContentTabs } from "../components/MediaContentTabs";
+import { SwipeHint } from "../components/SwipeHint";
+
+import { Media, MediaDetail, Tag, Task } from "../types";
+import { getMedia } from "../services/media";
+import { getConfig } from "../services/config";
+import {
+  convertMedia,
+  deleteMediaRecord,
+  deleteMediaFile,
+  openMediaFolder,
+  openMediaFile,
+} from "../services/mediaActions";
+import { getTask } from "../services/task";
+
+export default function MediaDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const backgroundLocation = location.state?.backgroundLocation;
+  const sceneStartTime: number | null = location.state?.sceneStart ?? null;
+  const shouldAutoplayVideo = location.state?.autoplayVideo === true;
+  const buildNavigationState = useCallback(
+    (extra: Record<string, unknown> = {}) => {
+      const baseState = location.state ? { ...location.state } : {};
+      if (baseState && "sceneStart" in baseState) {
+        delete (baseState as Record<string, unknown>).sceneStart;
+      }
+      return { ...baseState, ...extra };
+    },
+    [location.state]
+  );
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down("md"));
+
+  // --- 1. STATE MANAGEMENT ---
+  const mediaListKey = location.state?.mediaListKey as string | undefined;
+  const listFromStore = useCachedList(mediaListKey);
+  // A. Global state from Zustand for the list context
+  const items = useMemo<unknown[]>(
+    () => listFromStore?.items ?? [],
+    [listFromStore]
+  );
+
+  const removeFromList = useListStore((state) => state.removeItems);
+
+  // B. Local state for this specific modal's content
+  const preloadedMedia = location.state?.media as Media | null;
+  const [detail, setDetail] = useState<MediaDetail | null>(
+    preloadedMedia ? { media: preloadedMedia, persons: [], orphans: [] } : null
+  );
+  const [isDetailLoading, setIsDetailLoading] = useState(true);
+  const [loadError, setLoadError] = useState<{ status?: number; message: string } | null>(null);
+
+  // C. Local state for all other UI and features
+  const [task, setTask] = useState<Task | null>(null);
+  const [dialogType, setDialogType] = useState<
+    "convert" | "deleteRecord" | "deleteFile" | null
+  >(null);
+  const [snackbar, setSnackbar] = useState<{
+    open: boolean;
+    message: string;
+    severity: "success" | "error";
+  }>({ open: false, message: "", severity: "success" });
+  // Empty string falls back to the media type's first tab until the user picks one
+  const [tabKey, setTabKey] = useState<string>("");
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
+  const [seekRequest, setSeekRequest] = useState<{ time: number; seq: number } | null>(null);
+  const handleSeekRequest = useCallback((time: number) => {
+    setSeekRequest((prev) => ({ time, seq: (prev?.seq ?? 0) + 1 }));
+  }, []);
+  const videoTimeRef = useRef(0);
+  const handleVideoProgress = useCallback((secs: number) => {
+    videoTimeRef.current = secs;
+  }, []);
+  const [showSwipeHint, setShowSwipeHint] = useState(false);
+  const [isBinary, setIsBinary] = useState<boolean>(false);
+
+  // --- 2. DERIVED DATA & CONTEXT ---
+
+  const navigationIdsFromState = useMemo(() => {
+    const ids = location.state?.navigationContext?.ids;
+    if (!Array.isArray(ids)) return [];
+    return ids.filter((value): value is number => typeof value === "number");
+  }, [location.state]);
+
+  const allMediaIdsInView = useMemo(() => {
+    const extractItemId = (item: unknown): number | null => {
+      if (typeof item === "number") return item;
+      if (item && typeof item === "object") {
+        const candidate = item as {
+          id?: unknown;
+          media?: unknown;
+          data?: unknown;
+        };
+
+        if (typeof candidate.id === "number") return candidate.id;
+
+        const mediaCandidate = candidate.media as { id?: unknown } | undefined;
+        if (mediaCandidate && typeof mediaCandidate.id === "number") {
+          return mediaCandidate.id;
+        }
+
+        const dataCandidate = candidate.data as { id?: unknown } | undefined;
+        if (dataCandidate && typeof dataCandidate.id === "number") {
+          return dataCandidate.id;
+        }
+      }
+      return null;
+    };
+
+    if (navigationIdsFromState.length > 0) {
+      const numericId = id ? Number(id) : NaN;
+      if (
+        !Number.isNaN(numericId) &&
+        !navigationIdsFromState.includes(numericId)
+      ) {
+        return [...navigationIdsFromState, numericId];
+      }
+      return navigationIdsFromState;
+    }
+
+    const idsFromList = items
+      .map(extractItemId)
+      .filter((value): value is number => value !== null);
+
+    if (idsFromList.length > 0) {
+      return Array.from(new Set(idsFromList));
+    }
+
+    if (id) {
+      const numericId = Number(id);
+      return Number.isNaN(numericId) ? [] : [numericId];
+    }
+
+    return [];
+  }, [items, navigationIdsFromState, id]);
+  const neighbors = useMemo(() => {
+    if (!id || !allMediaIdsInView) return { previousId: null, nextId: null };
+    const currentIndex = allMediaIdsInView.findIndex(
+      (mediaId) => mediaId === Number(id)
+    );
+    if (currentIndex === -1) return { previousId: null, nextId: null };
+
+    const previousId =
+      currentIndex > 0 ? allMediaIdsInView[currentIndex - 1] : null;
+    const nextId =
+      currentIndex < allMediaIdsInView.length - 1
+        ? allMediaIdsInView[currentIndex + 1]
+        : null;
+    return { previousId, nextId };
+  }, [id, allMediaIdsInView]);
+
+  // --- 3. DATA FETCHING & NAVIGATION ---
+
+  const fetchDetail = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!id) return;
+      setIsDetailLoading(true);
+      setLoadError(null);
+      try {
+        const data = await getMedia(id, signal);
+        if (!signal?.aborted) setDetail(data);
+      } catch (err) {
+        if (!signal?.aborted) {
+          console.error("Failed to fetch media detail:", err);
+          setLoadError({
+            message:
+              err instanceof Error ? err.message : "加载媒体失败",
+          });
+        }
+      } finally {
+        if (!signal?.aborted) setIsDetailLoading(false);
+      }
+    },
+    [id]
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const currentPreloaded = location.state?.media as Media | null;
+    if (currentPreloaded && String(currentPreloaded.id) === id) {
+      setDetail({ media: currentPreloaded, persons: [], orphans: [] });
+    }
+    fetchDetail(controller.signal);
+    // Load app configuration to determine if running as binary
+    getConfig()
+      .then((cfg) => setIsBinary(!!cfg.general.is_binary))
+      .catch(() => setIsBinary(false));
+    return () => controller.abort();
+    // Preloaded media is only used to paint the first frame of a navigation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, location.key, fetchDetail]);
+
+  const handleNavigate = useCallback(
+    (direction: "prev" | "next") => {
+      const targetId =
+        direction === "prev" ? neighbors.previousId : neighbors.nextId;
+      if (!targetId) return;
+
+      navigate(`/medium/${targetId}`, {
+        state: buildNavigationState({ media: null, autoplayVideo: true }),
+        replace: !!backgroundLocation,
+      });
+    },
+    [navigate, neighbors, buildNavigationState, backgroundLocation]
+  );
+
+  useEffect(() => {
+    if (isMobile && (neighbors.nextId || neighbors.previousId)) {
+      const hintShown = sessionStorage.getItem("swipeHintShown");
+      if (!hintShown) {
+        setShowSwipeHint(true);
+        sessionStorage.setItem("swipeHintShown", "true");
+      }
+    }
+  }, [isMobile, neighbors.nextId, neighbors.previousId]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest?.("input, textarea, [contenteditable='true']")) {
+        return;
+      }
+      if (dialogType) return;
+      if (e.key === "ArrowLeft") handleNavigate("prev");
+      if (e.key === "ArrowRight") handleNavigate("next");
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleNavigate, dialogType]);
+
+  useEffect(() => {
+    if (!task?.id || ["completed", "cancelled"].includes(task.status)) return;
+    const intervalId = setInterval(async () => {
+      try {
+        const updatedTask = await getTask(task.id);
+        if (["completed", "cancelled"].includes(updatedTask.status)) {
+          clearInterval(intervalId);
+          if (updatedTask.status === "completed") fetchDetail();
+        }
+        setTask(updatedTask);
+      } catch (error) {
+        console.error("Failed to fetch task status:", error);
+        clearInterval(intervalId);
+      }
+    }, 1500);
+    return () => clearInterval(intervalId);
+  }, [task?.id, task?.status, fetchDetail]);
+
+  // Per-media processor runs (started from the "Processors" tab) are fired
+  // and forgotten by that tab — reload the detail once one actually
+  // completes so newly detected faces/tags/exif show up without a manual
+  // refresh. Skip the version seen at mount so this doesn't refetch just
+  // because some unrelated processor run finished before this page opened.
+  const processorTaskVersion = useTaskCompletionVersion([
+    "run_processor_for_media",
+  ]);
+  const seenProcessorTaskVersionRef = useRef(processorTaskVersion);
+  useEffect(() => {
+    if (seenProcessorTaskVersionRef.current === processorTaskVersion) return;
+    seenProcessorTaskVersionRef.current = processorTaskVersion;
+    fetchDetail();
+  }, [processorTaskVersion, fetchDetail]);
+
+  const handleTouchStart = (e: React.TouchEvent) =>
+    setTouchStartX(e.targetTouches[0].clientX);
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    const touchEndX = e.changedTouches[0].clientX;
+    if (touchStartX === null) return;
+    const distance = touchStartX - touchEndX;
+    if (distance > 50) handleNavigate("next");
+    else if (distance < -50) handleNavigate("prev");
+    setTouchStartX(null);
+  };
+  const handleMediaUpdate = (updatedMedia: Media) => {
+    setDetail((prevDetail) => {
+      if (!prevDetail) return null;
+      return { ...prevDetail, media: updatedMedia };
+    });
+  };
+
+  const handleTagAddedToMedia = (newTag: Tag) => {
+    setDetail((prevDetail) => {
+      if (!prevDetail) return null;
+
+      const updatedMedia = {
+        ...prevDetail.media,
+        tags: [...(prevDetail.media.tags || []), newTag],
+      };
+
+      return { ...prevDetail, media: updatedMedia };
+    });
+  };
+
+  const closeDialog = () => setDialogType(null);
+  const confirmConvert = async () => {
+    if (!detail || !detail.media) return;
+    try {
+      const t = await convertMedia(detail.media.id);
+      setTask(t);
+      setSnackbar({
+        open: true,
+        message: "转换已开始",
+        severity: "success",
+      });
+    } catch {
+      setSnackbar({
+        open: true,
+        message: "转换失败",
+        severity: "error",
+      });
+    } finally {
+      closeDialog();
+    }
+  };
+  const navigateAfterDelete = useCallback(() => {
+    if (backgroundLocation) {
+      navigate(-1);
+    } else {
+      navigate("/");
+    }
+  }, [navigate, backgroundLocation]);
+
+  const confirmDeleteRecord = async () => {
+    if (!detail || !detail.media) return;
+    try {
+      if (mediaListKey) removeFromList(mediaListKey, [detail.media.id]);
+      await deleteMediaRecord(detail.media.id);
+      setSnackbar({
+        open: true,
+        message: "记录已删除",
+        severity: "success",
+      });
+      navigateAfterDelete();
+    } catch {
+      setSnackbar({ open: true, message: "删除失败", severity: "error" });
+    } finally {
+      closeDialog();
+    }
+  };
+  const confirmDeleteFile = async () => {
+    if (!detail || !detail.media) return;
+    try {
+      if (mediaListKey) removeFromList(mediaListKey, [detail.media.id]);
+      await deleteMediaFile(detail.media.id);
+      setSnackbar({ open: true, message: "文件已删除", severity: "success" });
+      navigateAfterDelete();
+    } catch {
+      setSnackbar({
+        open: true,
+        message: "文件删除失败",
+        severity: "error",
+      });
+    } finally {
+      closeDialog();
+    }
+  };
+
+  const handleClose = () => {
+    if (backgroundLocation) {
+      navigate(-1);
+    } else {
+      navigate("/");
+    }
+  };
+  const isLoading = !detail && isDetailLoading;
+
+  return (
+    <Dialog
+      open={true}
+      onClose={handleClose}
+      fullWidth
+      maxWidth="xl"
+      fullScreen={isMobile}
+      slotProps={{
+        backdrop: { sx: { backgroundColor: (theme) => `rgba(0,0,0,${theme.palette.mode === 'dark' ? 0.85 : 0.8})` } },
+        paper: {
+          sx: {
+            mt: { xs: 0, sm: 4, md: 8 },
+            borderRadius: { xs: 0, sm: 2 },
+          },
+        },
+      }}
+      sx={{
+        "& .MuiDialog-container": {
+          alignItems: "flex-start",
+        },
+      }}
+    >
+      <IconButton aria-label="关闭"
+        onClick={handleClose}
+        sx={{
+          position: "absolute",
+          right: 8,
+          top: 8,
+          zIndex: 1000,
+          color: "grey.500",
+          bgcolor: { xs: "rgba(0,0,0,0.3)", sm: "transparent" },
+          "&:hover": {
+             bgcolor: { xs: "rgba(0,0,0,0.5)", sm: "rgba(0,0,0,0.04)" },
+          }
+        }}
+      >
+        <CloseIcon />
+      </IconButton>
+      <DialogContent sx={{ p: { xs: 0, sm: 2, md: 3 } }}>
+        {isLoading ? (
+          <Box
+            sx={{
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              height: "80vh",
+            }}
+          >
+            <CircularProgress />
+          </Box>
+        ) : loadError && !detail ? (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              alignItems: "center",
+              gap: 2,
+              height: "60vh",
+            }}
+          >
+            <Alert severity="error">{loadError.message}</Alert>
+            <Box sx={{ display: "flex", gap: 1 }}>
+              <Button variant="contained" onClick={() => fetchDetail()}>
+                {" 重试 "}</Button>
+              <Button onClick={handleClose}>{"关闭"}</Button>
+            </Box>
+          </Box>
+        ) : (
+          detail && (
+            <Container maxWidth="xl" sx={{ pt: { xs: 0, sm: 2 }, pb: { xs: 2, sm: 6 }, px: { xs: 0, sm: 3 } }}>
+              {task &&
+                (task.status === "running" || task.status === "pending") && (
+                  <Box mb={2}>
+                    <Typography variant="body2" gutterBottom>
+                      {" 正在转换… "}{task.processed}%
+                    </Typography>
+                    <LinearProgress
+                      variant="determinate"
+                      value={task.processed}
+                      sx={{ height: 8, borderRadius: 1 }}
+                    />
+                  </Box>
+                )}
+              <Box
+                sx={{
+                  position: "relative",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {!isMobile && neighbors.previousId && (
+                  <IconButton aria-label="上一项媒体"
+                    onClick={() => handleNavigate("prev")}
+                    disabled={isDetailLoading}
+                    sx={{
+                      position: "absolute",
+                      left: -40,
+                      zIndex: 1,
+                      "&.Mui-disabled": { opacity: 0.2 },
+                    }}
+                  >
+                    <ArrowBackIosNew fontSize="large" />
+                  </IconButton>
+                )}
+                <Box
+                  onTouchStart={handleTouchStart}
+                  onTouchEnd={handleTouchEnd}
+                  sx={{ width: "90%" }}
+                >
+                  <MediaHeader
+                    media={detail.media}
+                    onOpenDialog={setDialogType}
+                    isBinary={isBinary}
+                    onFavoriteChange={handleMediaUpdate}
+                    onOpenFolder={async (mediaId) => {
+                      try {
+                        await openMediaFolder(mediaId);
+                      } catch (error: unknown) {
+                        const message =
+                          error instanceof Error && error.message
+                            ? error.message
+                            : "打开文件夹失败";
+                        setSnackbar({ open: true, message, severity: "error" });
+                      }
+                    }}
+                    onOpenFile={async (mediaId) => {
+                      try {
+                        await openMediaFile(mediaId);
+                      } catch (error: unknown) {
+                        const message =
+                          error instanceof Error && error.message
+                            ? error.message
+                            : "打开文件失败";
+                        setSnackbar({ open: true, message, severity: "error" });
+                      }
+                    }}
+                  />
+                  <MediaDisplay
+                    media={detail.media}
+                    initialTime={sceneStartTime ?? undefined}
+                    autoplay={shouldAutoplayVideo}
+                    seekRequest={seekRequest}
+                    onProgress={handleVideoProgress}
+                  />
+                </Box>
+                {showSwipeHint && <SwipeHint />}
+                {!isMobile && neighbors.nextId && (
+                  <IconButton aria-label="下一项媒体"
+                    onClick={() => handleNavigate("next")}
+                    disabled={isDetailLoading}
+                    sx={{
+                      position: "absolute",
+                      right: -40,
+                      zIndex: 1,
+                      "&.Mui-disabled": { opacity: 0.2 },
+                    }}
+                  >
+                    <ArrowForwardIos fontSize="large" />
+                  </IconButton>
+                )}
+              </Box>
+              <ActionDialogs
+                dialogType={dialogType}
+                onClose={closeDialog}
+                onConfirmConvert={confirmConvert}
+                onConfirmDeleteRecord={confirmDeleteRecord}
+                onConfirmDeleteFile={confirmDeleteFile}
+              />
+              {isDetailLoading ? (
+                <Box
+                  sx={{
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    flexGrow: 1, // Allow the box to grow and fill the minHeight
+                  }}
+                >
+                  <CircularProgress />
+                </Box>
+              ) : (
+                <MediaContentTabs
+                  detail={detail}
+                  tabKey={tabKey}
+                  onTabChange={setTabKey}
+                  onTagAdded={handleTagAddedToMedia}
+                  onDetailReload={fetchDetail}
+                  onTagUpdate={handleMediaUpdate}
+                  onSeekRequest={handleSeekRequest}
+                  videoTimeRef={videoTimeRef}
+                />
+              )}
+              <Snackbar
+                open={snackbar.open}
+                autoHideDuration={3000}
+                onClose={() => setSnackbar({ ...snackbar, open: false })}
+                anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+              >
+                <Alert
+                  severity={snackbar.severity}
+                  sx={{ width: "100%" }}
+                  onClose={() => setSnackbar({ ...snackbar, open: false })}
+                >
+                  {snackbar.message}
+                </Alert>
+              </Snackbar>
+            </Container>
+          )
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

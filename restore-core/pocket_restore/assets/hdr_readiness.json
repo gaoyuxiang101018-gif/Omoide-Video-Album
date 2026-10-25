@@ -1,0 +1,8 @@
+{
+  "verified_profiles": ["dlog", "dlog2", "hlg"],
+  "verified_date": "2026-10-02",
+  "preset": "BT.2020 HLG, 203-nit diffuse white, 1000-nit nominal display",
+  "real_camera_tests": "D-Log and D-Log 2 to HLG; original HLG retained as HLG; 3840x2160, 60000/1001 fps, HEVC Main10; color tags, duration, audio count and decode verified",
+  "gray_axis_max_error_10bit_codes": 0.488,
+  "mimo_visual_match_verified": false
+}

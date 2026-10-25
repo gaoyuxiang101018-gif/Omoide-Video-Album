@@ -1,0 +1,11 @@
+{
+  "version": "0.7.5-zh.20261025",
+  "upstream": "https://github.com/EinAeffchen/Omoide",
+  "upstream_commit": "59dd2db769fd88d454b5479c5b0207989337363f",
+  "installed_executable_sha256": "10a05481b9b3a40737e58cf2d8cf313b0cc570b646d79a1b5a6a16ba969de60d",
+  "published_native_changes": [
+    "restoration cache accepts the launcher storage directory"
+  ],
+  "private_library_included": false,
+  "pretrained_weights_included": false
+}

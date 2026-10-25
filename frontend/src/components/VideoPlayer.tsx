@@ -1,0 +1,380 @@
+import { withMediaCacheScope } from "../urlUtils";
+import { useState, useEffect, useRef } from "react";
+import { Box, CircularProgress, Typography } from "@mui/material";
+// Only local files are played, so skip the streaming-provider players.
+import ReactPlayer from "react-player/file";
+import { Media } from "../types";
+import { API } from "../config";
+import { encodeFilePath } from "../urlUtils";
+
+/** One scene of the WebVTT track: its time range and preview image URL. */
+interface SceneCue {
+  start: number;
+  end: number;
+  url: string;
+}
+
+/**
+ * Audio-detection properties of a media element. `audioTracks`,
+ * `webkitAudioDecodedByteCount` and `mozHasAudio` are non-standard and only
+ * exist in some browsers, so every field is optional and checked at runtime.
+ */
+interface AudioInfoSource {
+  audioTracks?: { length?: unknown };
+  webkitAudioDecodedByteCount?: unknown;
+  mozHasAudio?: unknown;
+}
+
+const VOLUME_STORAGE_KEY = "smol.video.volume";
+const DEFAULT_VOLUME = 1;
+
+const clampVolume = (value: number) => Math.min(1, Math.max(0, value));
+
+const getStoredVolume = () => {
+  if (typeof window === "undefined") return DEFAULT_VOLUME;
+  try {
+    const stored = window.localStorage.getItem(VOLUME_STORAGE_KEY);
+    if (!stored) return DEFAULT_VOLUME;
+    const parsed = Number(stored);
+    return Number.isFinite(parsed) ? clampVolume(parsed) : DEFAULT_VOLUME;
+  } catch {
+    return DEFAULT_VOLUME;
+  }
+};
+
+const persistVolume = (value: number) => {
+  try {
+    window.localStorage.setItem(VOLUME_STORAGE_KEY, String(value));
+  } catch {
+    // Ignore storage write failures.
+  }
+};
+
+interface VideoWithPreviewProps {
+  media: Pick<Media, "id" | "path" | "thumbnail_path">;
+  initialTime?: number;
+  autoplay?: boolean;
+  seekRequest?: { time: number; seq: number } | null;
+  onProgress?: (playedSeconds: number) => void;
+  onEnded?: () => void;
+  onPlaybackError?: () => void;
+  progressInterval?: number;
+}
+
+export function VideoWithPreview({
+  media,
+  initialTime = 0,
+  autoplay = false,
+  seekRequest,
+  onProgress,
+  onEnded,
+  onPlaybackError,
+  progressInterval = 1000,
+}: VideoWithPreviewProps) {
+  const [isLoading, setIsLoading] = useState(false);
+  const [playbackError, setPlaybackError] = useState(false);
+  const mediaUrl = media
+    ? `${API}/originals/${encodeFilePath(media.path)}`
+    : `${API}/static/brand/404.png`;
+
+  const scenesUrl = `${API}/api/media/${media.id}/scenes.vtt`;
+  const thumbnailUrl = media.thumbnail_path
+    ? withMediaCacheScope(`${API}/thumbnails/${encodeFilePath(media.thumbnail_path)}`)
+    : withMediaCacheScope(`${API}/thumbnails/${media.id}.jpg`);
+
+  const [hasAudio, setHasAudio] = useState(true); //Used to calculate timeline width offset
+
+  const [cues, setCues] = useState<SceneCue[]>([]);
+  const [volume, setVolume] = useState(() => getStoredVolume());
+  const [hoverData, setHoverData] = useState({
+    visible: false,
+    image: "",
+    x: 0,
+  });
+
+  const playerWrapperRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<ReactPlayer>(null);
+  const hoverRafRef = useRef<number | null>(null);
+  const hoverClientXRef = useRef(0);
+  const [isReady, setIsReady] = useState(false);
+
+  const PROGRESS_BAR_LEFT_OFFSET = 48;
+  const PROGRESS_BAR_RIGHT_OFFSET = 225;
+
+  useEffect(() => {
+    if (!scenesUrl) return;
+    const controller = new AbortController();
+    fetch(scenesUrl, { signal: controller.signal })
+      .then((res) => res.text())
+      .then((text) => {
+        if (controller.signal.aborted) return;
+        const parsedCues = parseVTT(text);
+        setCues(parsedCues);
+      })
+      .catch((err) => {
+        if (err?.name !== "AbortError") console.error(err);
+      });
+    return () => controller.abort();
+  }, [scenesUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (hoverRafRef.current !== null) {
+        window.cancelAnimationFrame(hoverRafRef.current);
+      }
+    };
+  }, []);
+
+  const parseVTT = (data: string): SceneCue[] => {
+    const pattern =
+      /^(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})\n(.*?)$/gm;
+    const toSeconds = (t: string) => {
+      const a = t.split(":");
+      return +a[0] * 3600 + +a[1] * 60 + +a[2];
+    };
+    let match;
+    const result: SceneCue[] = [];
+    while ((match = pattern.exec(data)) !== null) {
+      result.push({
+        start: toSeconds(match[1]),
+        end: toSeconds(match[2]),
+        url: match[3],
+      });
+    }
+    return result;
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    // Throttle hover updates to one per animation frame, but always use the
+    // latest cursor position — intermediate mousemove events within the same
+    // frame must not be dropped, or the preview lags behind the cursor.
+    hoverClientXRef.current = e.clientX;
+    if (hoverRafRef.current !== null) return;
+    hoverRafRef.current = window.requestAnimationFrame(() => {
+      hoverRafRef.current = null;
+      updateHoverPreview(hoverClientXRef.current);
+    });
+  };
+
+  const updateHoverPreview = (clientX: number) => {
+    const wrapper = playerWrapperRef.current;
+    const player = playerRef.current;
+    if (!wrapper || !player || !cues.length) return;
+
+    const rect = wrapper.getBoundingClientRect();
+    const duration = player.getDuration();
+    if (!duration) return;
+
+    const progressBarStart = PROGRESS_BAR_LEFT_OFFSET;
+    let progressBarEnd = rect.width - PROGRESS_BAR_RIGHT_OFFSET;
+    if (!hasAudio) {
+      progressBarEnd = progressBarEnd + 70;
+    }
+    const progressBarWidth = progressBarEnd - progressBarStart;
+
+    const mouseX = clientX - rect.left;
+
+    if (mouseX < progressBarStart || mouseX > progressBarEnd) {
+      if (hoverData.visible) handleMouseLeave(); // Hide preview if visible
+      return;
+    }
+
+    const progressPercent = Math.max(
+      0,
+      Math.min(1, (mouseX - progressBarStart) / progressBarWidth)
+    );
+    const hoverTime = progressPercent * duration;
+    const cue = cues.find((c) => hoverTime >= c.start && hoverTime < c.end);
+
+    if (cue) {
+      // Your VTT URLs might be relative. Prepend API if necessary.
+      const imageUrl = cue.url.startsWith("http")
+        ? cue.url
+        : `${API}${cue.url}`;
+      setHoverData({
+        visible: true,
+        image: imageUrl,
+        x: mouseX,
+      });
+    } else {
+      // Hide if no cue found (e.g., hovering over black bars)
+      if (hoverData.visible) {
+        setHoverData({ ...hoverData, visible: false });
+      }
+    }
+  };
+
+  const handleMouseLeave = () => {
+    setHoverData({ ...hoverData, visible: false });
+  };
+
+  const detectHasAudio = (el: AudioInfoSource | null | undefined): boolean => {
+    if (!el) return true;
+    if (el.audioTracks && typeof el.audioTracks.length === "number") {
+      return el.audioTracks.length > 0;
+    }
+    if (typeof el.webkitAudioDecodedByteCount === "number") {
+      return el.webkitAudioDecodedByteCount > 0;
+    }
+    if (typeof el.mozHasAudio === "boolean") {
+      return el.mozHasAudio;
+    }
+    return true;
+  };
+
+  const handleReady = () => {
+    setIsLoading(false);
+    const internalPlayer = playerRef.current?.getInternalPlayer();
+    setHasAudio(detectHasAudio(internalPlayer));
+    setIsReady(true);
+  };
+
+  const handleVolumeChange = (nextVolume: number) => {
+    if (!Number.isFinite(nextVolume)) return;
+    const clamped = clampVolume(nextVolume);
+    setVolume(clamped);
+    persistVolume(clamped);
+  };
+
+  useEffect(() => {
+    if (!isReady) return;
+    const internalPlayer = playerRef.current?.getInternalPlayer?.();
+    if (!internalPlayer || !internalPlayer.addEventListener) return;
+
+    const handleInternalVolumeChange = () => {
+      if (!internalPlayer || typeof internalPlayer.volume !== "number") return;
+      handleVolumeChange(internalPlayer.volume);
+    };
+
+    internalPlayer.addEventListener(
+      "volumechange",
+      handleInternalVolumeChange
+    );
+    return () => {
+      try {
+        internalPlayer.removeEventListener(
+          "volumechange",
+          handleInternalVolumeChange
+        );
+      } catch {
+        // Ignore cleanup errors when the player is already disposed.
+      }
+    };
+  }, [isReady]);
+
+  useEffect(() => {
+    if (!isReady || !playerRef.current) return;
+    if (initialTime && initialTime > 0) {
+      playerRef.current.seekTo(initialTime, "seconds");
+    } else {
+      playerRef.current.seekTo(0, "seconds");
+    }
+  }, [isReady, initialTime, media.id]);
+
+  useEffect(() => {
+    if (!isReady || !playerRef.current || seekRequest == null) return;
+    playerRef.current.seekTo(seekRequest.time, "seconds");
+    const element=playerRef.current.getInternalPlayer() as HTMLMediaElement | undefined;
+    if(element?.play)void element.play().catch(()=>{});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, seekRequest?.seq]);
+
+  if (!media || !media.path) {
+    return <Typography color="text.secondary">{"无可用视频"}</Typography>;
+  }
+
+  return (
+    <Box
+      ref={playerWrapperRef}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+      sx={{
+        width: "100%",
+        position: "relative",
+        paddingTop: "56.25%",
+        bgcolor: "common.black",
+        cursor: "pointer", // Indicate interactivity
+      }}
+    >
+      {/* Loading spinner */}
+      {isLoading && (
+        <Box
+          sx={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1,
+          }}
+        >
+          <CircularProgress />
+        </Box>
+      )}
+
+      {playbackError && (
+        <Box
+          sx={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 2,
+            zIndex: 3,
+            bgcolor: "rgba(0,0,0,0.85)",
+            color: "common.white",
+            p: 2,
+          }}
+        >
+          <Typography variant="body1" align="center">
+            {" 此格式无法在浏览器中播放。 "}</Typography>
+          <Typography variant="body2" align="center" color="inherit">
+            {" 使用工具栏中的“打开文件”按钮在默认应用程序中播放。 "}</Typography>
+        </Box>
+      )}
+
+      <ReactPlayer
+        ref={playerRef}
+        url={mediaUrl}
+        controls
+        playing
+        volume={volume}
+        width="100%"
+        height="100%"
+        style={{ position: "absolute", top: 0, left: 0 }} // Disable pointer events on the player itself
+        light={autoplay || seekRequest ? false : thumbnailUrl}
+        onReady={handleReady}
+        onProgress={({ playedSeconds }) => onProgress?.(playedSeconds)}
+        progressInterval={progressInterval}
+        onEnded={onEnded}
+        onError={() => { setIsLoading(false); setPlaybackError(true); onPlaybackError?.(); }}
+        // The config track is not needed for the manual implementation
+      />
+
+      {/* 3. Display the thumbnail preview */}
+      {hoverData.visible && (
+        <Box
+          sx={{
+            position: "absolute",
+            bottom: "80px", // Adjust this based on your control bar height
+            left: hoverData.x,
+            transform: "translateX(-50%)",
+            bgcolor: "common.black",
+            border: (theme) => `1px solid ${theme.palette.common.white}`,
+            p: "2px",
+            zIndex: 2, // Ensure it's on top
+            pointerEvents: "none", // Prevent the preview from capturing mouse events
+          }}
+        >
+          <img
+            src={hoverData.image}
+            alt="预览"
+            style={{ width: 160, display: "block" }}
+          />
+        </Box>
+      )}
+    </Box>
+  );
+}

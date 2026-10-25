@@ -1,0 +1,702 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Box,
+  Collapse,
+  Typography,
+  Button,
+  LinearProgress,
+  Stack,
+  List,
+  ListItem,
+  ListItemButton,
+  ListItemIcon,
+  ListItemText,
+  ListSubheader,
+  Divider,
+  Snackbar,
+  Alert,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  FormControlLabel,
+  Switch,
+} from "@mui/material";
+import { TaskFailure, TaskType } from "../types";
+import {
+  startTask as startTaskService,
+  cancelTask as cancelTaskService,
+  getTaskFailures,
+  runProcessor,
+} from "../services/taskActions";
+import { useTaskEvents } from "../TaskEventsContext";
+import config from "../config";
+import SyncIcon from "@mui/icons-material/Sync";
+import MovieIcon from "@mui/icons-material/Movie";
+import Diversity3Icon from "@mui/icons-material/Diversity3";
+import CleaningServicesIcon from "@mui/icons-material/CleaningServices";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import FaceIcon from "@mui/icons-material/Face";
+import FaceRetouchingNaturalIcon from "@mui/icons-material/FaceRetouchingNatural";
+import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import BubbleChartIcon from "@mui/icons-material/BubbleChart";
+import LabelIcon from "@mui/icons-material/Label";
+import BlurOnIcon from "@mui/icons-material/BlurOn";
+import CameraAltIcon from "@mui/icons-material/CameraAlt";
+
+// Friendly names for the raw current_step keys published by backend tasks.
+// Unknown steps fall back to the raw key.
+const STEP_LABELS: Record<string, string> = {
+  discovering: "查找文件",
+  scanning: "扫描文件夹",
+  processing: "处理文件",
+  indexing: "建立索引",
+  loading_model: "加载模型",
+  extracting_frames: "提取视频画面",
+  clustering_batches: "正在准备人物自动归类批次",
+  clustering_batch: "正在归类人脸",
+  clustering_unassigned: "正在归类人脸",
+  merging_similar_persons: "正在合并相似人物",
+  matching_known_persons: "正在将人脸与已知人物匹配",
+  backfilling_face_quality: "正在评估人脸质量",
+};
+
+type TaskLabels = Partial<Record<TaskType, string>>;
+const TASK_LABELS: TaskLabels = {
+  scan: "扫描新文件",
+  process_media: "识别未处理文件",
+  clean_missing_files: "移除缺失记录",
+  cluster_persons: "人物自动归类",
+  find_duplicates: "查找重复项",
+  compute_blur_scores: "模糊评分",
+  run_processor: "运行处理器",
+  run_processor_for_media: "重新运行处理器（所选）",
+  auto_tag_custom: "应用新的自定义标签",
+  backfill_face_timestamps: "回填人脸时间戳",
+  backfill_face_quality: "评估人脸质量",
+  build_events: "事件自动归类",
+  geocode_places: "地点地理编码",
+  export_person_media: "导出人物媒体",
+  export_person_clips: "导出人物片段",
+  refine_face_range: "局部人脸精查",
+};
+
+const PROCESSOR_ACTIONS = [
+  { name: "faces", label: "人脸检测", icon: <FaceIcon /> },
+  { name: "embedding_extractor", label: "图像特征", icon: <BubbleChartIcon /> },
+  { name: "auto_tagger", label: "自动标签", icon: <LabelIcon /> },
+  { name: "blur", label: "模糊评分", icon: <BlurOnIcon /> },
+  { name: "exif", label: "EXIF 数据", icon: <CameraAltIcon /> },
+] as const;
+
+type TaskManagerProps = {
+  isActive: boolean;
+};
+
+export default function TaskManager({ isActive }: TaskManagerProps) {
+  const { activeTasks, forceRefresh, lastCompletedTasks } =
+    useTaskEvents(isActive);
+  const [processorsExpanded, setProcessorsExpanded] = useState(false);
+  const [forceReprocess, setForceReprocess] = useState(false);
+  const [snack, setSnack] = useState<{
+    open: boolean;
+    msg: string;
+    sev: "success" | "error";
+    action?: React.ReactNode;
+  }>({ open: false, msg: "", sev: "success" });
+  const [failureEntries, setFailureEntries] = useState<TaskFailure[]>([]);
+  const [failureDialogOpen, setFailureDialogOpen] = useState(false);
+  const [failureTaskId, setFailureTaskId] = useState<string | null>(null);
+  const [lastSeenScanTaskId, setLastSeenScanTaskId] = useState<string | null>(
+    () => sessionStorage.getItem("smol_lastSeenScanTaskId")
+  );
+  // Track when each task last made progress to enable an indeterminate fallback
+  const lastProgressRef = useRef<
+    Record<string, { value: number; changedAt: number }>
+  >({});
+
+  const loadFailures = useCallback(
+    async (
+      taskId: string,
+      {
+        openDialog = true,
+        notifyEmpty = true,
+      }: { openDialog?: boolean; notifyEmpty?: boolean } = {}
+    ) => {
+      try {
+        const entries = await getTaskFailures(taskId);
+        if (!entries.length) {
+          if (notifyEmpty) {
+            setSnack({
+              open: true,
+              msg: "此任务未记录失败。",
+              sev: "success",
+            });
+          }
+          setFailureEntries([]);
+          setFailureTaskId(null);
+          if (openDialog) {
+            setFailureDialogOpen(false);
+          }
+          return entries;
+        }
+        setFailureEntries(entries);
+        setFailureTaskId(taskId);
+        if (openDialog) {
+          setFailureDialogOpen(true);
+        }
+        return entries;
+      } catch (err) {
+        console.error("Failed to load failures for task", taskId, err);
+        setSnack({
+          open: true,
+          msg: "加载失败详情失败",
+          sev: "error",
+        });
+        return [] as TaskFailure[];
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    const now = Date.now();
+    const nextMap: Record<string, { value: number; changedAt: number }> = {
+      ...lastProgressRef.current,
+    };
+
+    activeTasks.forEach((t) => {
+      const effectiveProcessed =
+        t.task_type === "cluster_persons" &&
+        typeof t.merge_processed === "number" &&
+        typeof t.merge_total === "number" &&
+        t.merge_total > 0
+          ? t.merge_processed
+          : t.processed;
+      const prev = nextMap[t.id];
+      if (!prev || prev.value !== effectiveProcessed) {
+        nextMap[t.id] = { value: effectiveProcessed, changedAt: now };
+      }
+    });
+
+    const activeIds = new Set(activeTasks.map((t) => t.id));
+    Object.keys(nextMap).forEach((id) => {
+      if (!activeIds.has(id)) {
+        delete nextMap[id];
+      }
+    });
+
+    lastProgressRef.current = nextMap;
+  }, [activeTasks]);
+
+  useEffect(() => {
+    const completedScan = lastCompletedTasks.scan;
+    if (!completedScan || completedScan.id === lastSeenScanTaskId) {
+      return;
+    }
+    setLastSeenScanTaskId(completedScan.id);
+    sessionStorage.setItem("smol_lastSeenScanTaskId", completedScan.id);
+    loadFailures(completedScan.id, { notifyEmpty: false }).then((entries) => {
+      if (!entries.length) {
+        return;
+      }
+      setSnack({
+        open: true,
+        msg: ("扫描跳过了 {0} 个文件{1}。".replace(/\{(\d+)\}/g, (_, i) => String([entries.length, entries.length === 1 ? "" : ""][Number(i)]))),
+        sev: "error",
+        action: (
+          <Button
+            color="inherit"
+            size="small"
+            onClick={() => setFailureDialogOpen(true)}
+          >
+            {" 查看 "}</Button>
+        ),
+      });
+    });
+  }, [lastCompletedTasks, lastSeenScanTaskId, loadFailures]);
+
+  const startTask = async (type: TaskType) => {
+    try {
+      await startTaskService(type);
+      await forceRefresh();
+      setSnack({
+        open: true,
+        msg: ("{0} 已启动".replace(/\{(\d+)\}/g, (_, i) => String([TASK_LABELS[type] ?? type][Number(i)]))),
+        sev: "success",
+      });
+    } catch (err) {
+      console.error("Error starting task", type, err);
+      const msg =
+        (err instanceof Error && err.message) || "启动任务失败";
+      setSnack({ open: true, msg, sev: "error" });
+    }
+  };
+
+  const cancelTask = async (id: string) => {
+    try {
+      await cancelTaskService(id);
+      await forceRefresh();
+    } catch (err) {
+      console.error("Error cancelling task", id, err);
+    }
+  };
+
+  const isTaskRunning = (type: TaskType) =>
+    activeTasks.some(
+      (t) =>
+        t.task_type === type &&
+        (t.status === "running" || t.status === "pending")
+    );
+
+  const isAnyProcessorRunning =
+    isTaskRunning("run_processor") ||
+    isTaskRunning("run_processor_for_media") ||
+    isTaskRunning("auto_tag_custom");
+
+  const runProcessorAction = async (processorName: string, label: string) => {
+    try {
+      await runProcessor(processorName, forceReprocess);
+      await forceRefresh();
+      setSnack({
+        open: true,
+        msg: forceReprocess
+          ? ("{0} 已启动（重新处理所有文件）".replace(/\{(\d+)\}/g, (_, i) => String([label][Number(i)])))
+          : ("{0} 已启动".replace(/\{(\d+)\}/g, (_, i) => String([label][Number(i)]))),
+        sev: "success",
+      });
+    } catch (err) {
+      setSnack({
+        open: true,
+        msg: (err instanceof Error && err.message) || "启动处理器失败",
+        sev: "error",
+      });
+    }
+  };
+
+  return (
+    <>
+      <Snackbar
+        open={snack.open}
+        autoHideDuration={4000}
+        onClose={() => setSnack({ ...snack, open: false })}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert
+          severity={snack.sev}
+          onClose={() => setSnack({ ...snack, open: false })}
+          action={snack.action}
+        >
+          {snack.msg}
+        </Alert>
+      </Snackbar>
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <Box sx={{ flexGrow: 1 }}>
+          {failureEntries.length > 0 && (
+            <Alert
+              severity="warning"
+              sx={{ mb: 2 }}
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={() => setFailureDialogOpen(true)}
+                >
+                  {" 查看 "}</Button>
+              }
+            >
+              {" 上次扫描跳过 "}{failureEntries.length} {" 文件 "}{failureEntries.length === 1 ? "" : ""}.
+            </Alert>
+          )}
+          {/* Active Tasks Section */}
+          {activeTasks.length > 0 && (
+            <Stack spacing={2} mb={2}>
+              <Typography variant="overline" color="text.secondary">
+                {" 活动任务 "}</Typography>
+              {activeTasks.map((t) => {
+                const isClusterTask = t.task_type === "cluster_persons";
+                const hasMergeProgress =
+                  isClusterTask &&
+                  typeof t.merge_total === "number" &&
+                  t.merge_total > 0 &&
+                  typeof t.merge_processed === "number";
+                const effectiveProcessed = hasMergeProgress
+                  ? t.merge_processed ?? 0
+                  : t.processed;
+                const effectiveTotal = hasMergeProgress
+                  ? t.merge_total ?? 0
+                  : t.total;
+                const pct =
+                  effectiveTotal > 0
+                    ? Math.min(
+                        100,
+                        Math.round((effectiveProcessed / effectiveTotal) * 100)
+                      )
+                    : t.status === "completed"
+                      ? 100
+                      : 0;
+                const lp = lastProgressRef.current[t.id];
+                const staleForMs = lp
+                  ? Date.now() - lp.changedAt
+                  : Number.POSITIVE_INFINITY;
+                // If we haven't seen progress in a bit (e.g., long video/scenes/model load),
+                // switch to an indeterminate bar to show activity.
+                const showIndeterminate =
+                  t.status === "running" &&
+                  (effectiveTotal === 0 || staleForMs > 8000 || t.current_step === "indexing");
+                const failureCount = t.failure_count ?? 0;
+                const clusteringPct =
+                  isClusterTask && t.total > 0
+                    ? Math.min(
+                        100,
+                        Math.round((t.processed / t.total) * 100)
+                      )
+                    : null;
+                const totalDisplay =
+                  effectiveTotal > 0 ? effectiveTotal : "?";
+                const pctLabel = showIndeterminate ? "..." : `${pct}%`;
+                return (
+                  <Box key={t.id} sx={{ overflow: "hidden", minWidth: 0 }}>
+                    <Box
+                      display="flex"
+                      justifyContent="space-between"
+                      alignItems="center"
+                      gap={1}
+                    >
+                      <Typography variant="body2" fontWeight="bold" noWrap sx={{ flex: 1, minWidth: 0 }}>
+                        {TASK_LABELS[t.task_type] ?? t.task_type}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+                        {t.status === "running" ? pctLabel : ({pending: "等待中", completed: "已完成", failed: "失败", cancelled: "已取消"}[t.status] ?? t.status)}
+                      </Typography>
+                    </Box>
+                    {hasMergeProgress ? (
+                      <Box sx={{ mt: 0.5 }}>
+                        {typeof clusteringPct === "number" && (
+                          <>
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              noWrap
+                              sx={{ display: "block" }}
+                            >
+                              {("归类：{0}%（{1}/{2}）".replace(/\{(\d+)\}/g, (_, i) => String([clusteringPct, t.processed, t.total][Number(i)])))}
+                            </Typography>
+                            <LinearProgress
+                              variant="determinate"
+                              value={clusteringPct}
+                              sx={{
+                                height: 6,
+                                borderRadius: 3,
+                                mt: 0.5,
+                                bgcolor: "divider",
+                                "& .MuiLinearProgress-bar": {
+                                  bgcolor: "primary.main",
+                                },
+                              }}
+                            />
+                          </>
+                        )}
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          noWrap
+                          sx={{
+                            display: "block",
+                            mt: typeof clusteringPct === "number" ? 1 : 0,
+                          }}
+                        >
+                          {("合并：{0}（{1}/{2}）{3}".replace(/\{(\d+)\}/g, (_, i) => String([pctLabel, effectiveProcessed, totalDisplay, typeof t.merge_pending === "number"
+                              ? ` · 待合并 ${t.merge_pending}`
+                              : ""][Number(i)])))}
+                        </Typography>
+                        <LinearProgress
+                          variant={
+                            showIndeterminate ? "indeterminate" : "determinate"
+                          }
+                          value={showIndeterminate ? undefined : pct}
+                          sx={{
+                            height: 6,
+                            borderRadius: 3,
+                            mt: 0.5,
+                            bgcolor: "divider",
+                            "& .MuiLinearProgress-bar": {
+                              bgcolor: "primary.main",
+                            },
+                          }}
+                        />
+                      </Box>
+                    ) : (
+                      <LinearProgress
+                        variant={
+                          showIndeterminate ? "indeterminate" : "determinate"
+                        }
+                        value={showIndeterminate ? undefined : pct}
+                        sx={{
+                          height: 6,
+                          borderRadius: 3,
+                          mt: 0.5,
+                          bgcolor: "divider",
+                          "& .MuiLinearProgress-bar": {
+                            bgcolor: "primary.main",
+                          },
+                        }}
+                      />
+                    )}
+                    {t.status === "running" && effectiveTotal > 0 && !showIndeterminate && (
+                      <Typography variant="caption" color="text.disabled" noWrap sx={{ display: "block" }}>
+                        {effectiveProcessed.toLocaleString()} / {effectiveTotal.toLocaleString()}
+                      </Typography>
+                    )}
+                    {failureCount > 0 && (
+                      <Box
+                        display="flex"
+                        justifyContent="space-between"
+                        alignItems="center"
+                        mt={0.5}
+                      >
+                        <Typography variant="caption" color="error.main">
+                          {failureCount} {" 文件"}{failureCount === 1 ? "" : ""}{" "}
+                          {" 失败 "}</Typography>
+                        <Button
+                          size="small"
+                          onClick={() =>
+                            loadFailures(t.id, { notifyEmpty: false })
+                          }
+                          sx={{ ml: 1 }}
+                        >
+                          {" 查看 "}</Button>
+                      </Box>
+                    )}
+                    {t.status === "running" && (
+                      <Typography variant="caption" color="text.secondary" noWrap sx={{ display: "block" }}>
+                        {t.current_step
+                          ? STEP_LABELS[t.current_step] ?? t.current_step
+                          : showIndeterminate
+                            ? "处理中..."
+                            : ""}
+                        {t.current_item
+                          ? `  —  ${t.current_item.replace(/.*[\\/]/, "")}`
+                          : ""}
+                      </Typography>
+                    )}
+                    {t.status === "running" && (
+                      <Button
+                        size="small"
+                        onClick={() => cancelTask(t.id)}
+                        sx={{ mt: 0.5, ml: -1, color: "text.secondary" }}
+                      >
+                        {" 取消 "}</Button>
+                    )}
+                  </Box>
+                );
+              })}
+            </Stack>
+          )}
+
+          <Divider sx={{ my: 2 }} />
+
+          <List disablePadding>
+            <ListSubheader
+              disableSticky
+              sx={{ bgcolor: "transparent", color: "text.secondary", fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", lineHeight: 2 }}
+            >
+              {" 任务 "}</ListSubheader>
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={() => startTask("scan")}
+                disabled={isTaskRunning("scan")}
+              >
+                <ListItemIcon>
+                  <SyncIcon />
+                </ListItemIcon>
+                <ListItemText primary="扫描新文件" />
+              </ListItemButton>
+            </ListItem>
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={() => startTask("process_media")}
+                disabled={isTaskRunning("process_media")}
+              >
+                <ListItemIcon>
+                  <MovieIcon />
+                </ListItemIcon>
+                <ListItemText primary="识别未处理文件" />
+              </ListItemButton>
+            </ListItem>
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={() => startTask("clean_missing_files")}
+                disabled={isTaskRunning("clean_missing_files")}
+              >
+                <ListItemIcon>
+                  <CleaningServicesIcon />
+                </ListItemIcon>
+                <ListItemText primary="移除缺失记录" />
+              </ListItemButton>
+            </ListItem>
+            {config.ENABLE_PEOPLE && (
+              <ListItem disablePadding>
+                <ListItemButton
+                  onClick={() => startTask("cluster_persons")}
+                  disabled={isTaskRunning("cluster_persons")}
+                >
+                  <ListItemIcon>
+                    <Diversity3Icon />
+                  </ListItemIcon>
+                  <ListItemText primary="人物自动归类" />
+                </ListItemButton>
+              </ListItem>
+            )}
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={() => startTask("find_duplicates")}
+                disabled={isTaskRunning("find_duplicates")}
+              >
+                <ListItemIcon>
+                  <ContentCopyIcon />
+                </ListItemIcon>
+                <ListItemText primary="查找重复项" />
+              </ListItemButton>
+            </ListItem>
+            {config.ENABLE_PEOPLE && (
+              <ListItem disablePadding>
+                <ListItemButton
+                  onClick={() => startTask("backfill_face_timestamps")}
+                  disabled={isTaskRunning("backfill_face_timestamps")}
+                >
+                  <ListItemIcon>
+                    <AccessTimeIcon />
+                  </ListItemIcon>
+                  <ListItemText
+                    primary="回填人脸时间戳"
+                    secondary="更新现有视频人脸的时间戳"
+                    secondaryTypographyProps={{ variant: "caption" }}
+                  />
+                </ListItemButton>
+              </ListItem>
+            )}
+            {config.ENABLE_PEOPLE && (
+              <ListItem disablePadding>
+                <ListItemButton
+                  onClick={() => startTask("backfill_face_quality")}
+                  disabled={isTaskRunning("backfill_face_quality")}
+                >
+                  <ListItemIcon>
+                    <FaceRetouchingNaturalIcon />
+                  </ListItemIcon>
+                  <ListItemText
+                    primary="评估人脸质量"
+                    secondary="评估现有人脸，避免模糊/侧脸照片形成错误人物分组"
+                    secondaryTypographyProps={{ variant: "caption" }}
+                  />
+                </ListItemButton>
+              </ListItem>
+            )}
+          </List>
+
+          <Divider sx={{ my: 1 }} />
+
+          <List disablePadding>
+            <ListItemButton
+              onClick={() => setProcessorsExpanded((v) => !v)}
+              sx={{ borderRadius: 1 }}
+            >
+              <ListSubheader
+                disableSticky
+                component="div"
+                sx={{ bgcolor: "transparent", color: "text.secondary", fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", p: 0, lineHeight: 1 }}
+              >
+                {" 单个处理器 "}</ListSubheader>
+              <Box sx={{ flexGrow: 1 }} />
+              {processorsExpanded ? <ExpandLessIcon fontSize="small" sx={{ color: "text.secondary" }} /> : <ExpandMoreIcon fontSize="small" sx={{ color: "text.secondary" }} />}
+            </ListItemButton>
+            <Collapse in={processorsExpanded} unmountOnExit>
+              <Typography variant="caption" color="text.secondary" sx={{ px: 2, display: "block" }}>
+                {forceReprocess
+                  ? "将重新处理所有文件，包括已运行过的文件。已分配的人脸会保留；仅重新处理未分配的人脸。"
+                  : "仅对未处理的项目运行。使用选择模式对特定文件重新运行。"}
+              </Typography>
+              <FormControlLabel
+                sx={{ px: 2, pb: 1 }}
+                control={
+                  <Switch
+                    size="small"
+                    checked={forceReprocess}
+                    onChange={(e) => setForceReprocess(e.target.checked)}
+                    disabled={isAnyProcessorRunning}
+                  />
+                }
+                label={
+                  <Typography variant="body2">{"强制重新处理所有文件"}</Typography>
+                }
+              />
+              {PROCESSOR_ACTIONS.map((p) => (
+                <ListItem key={p.name} disablePadding>
+                  <ListItemButton
+                    onClick={() => runProcessorAction(p.name, p.label)}
+                    disabled={isAnyProcessorRunning}
+                  >
+                    <ListItemIcon sx={{ color: "text.secondary" }}>
+                      {p.icon}
+                    </ListItemIcon>
+                    <ListItemText primary={p.label} />
+                  </ListItemButton>
+                </ListItem>
+              ))}
+            </Collapse>
+          </List>
+        </Box>
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ mt: "auto", pt: 2, textAlign: "center" }}
+        >
+          {("版本 {0}".replace(/\{(\d+)\}/g, (_, i) => String([config.APP_VERSION][Number(i)])))}
+        </Typography>
+      </Box>
+      <Dialog
+        open={failureDialogOpen}
+        onClose={() => setFailureDialogOpen(false)}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>{"跳过的文件（"}{failureEntries.length})</DialogTitle>
+        <DialogContent dividers>
+          {failureEntries.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              {" 未记录失败。 "}</Typography>
+          ) : (
+            <List dense disablePadding>
+              {failureEntries.map((entry, idx) => (
+                <ListItem
+                  key={`${entry.path}-${idx}`}
+                  alignItems="flex-start"
+                  sx={{ py: 0.5 }}
+                >
+                  <ListItemText
+                    primary={entry.path}
+                    secondary={entry.reason}
+                    primaryTypographyProps={{ variant: "body2" }}
+                    secondaryTypographyProps={{
+                      variant: "caption",
+                      color: "text.secondary",
+                    }}
+                  />
+                </ListItem>
+              ))}
+            </List>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ justifyContent: "space-between" }}>
+          <Typography variant="caption" color="text.secondary">
+            {failureTaskId ? ("任务：{0}".replace(/\{(\d+)\}/g, (_, i) => String([failureTaskId][Number(i)]))) : ""}
+          </Typography>
+          <Button onClick={() => setFailureDialogOpen(false)}>{"关闭"}</Button>
+        </DialogActions>
+      </Dialog>
+    </>
+  );
+}

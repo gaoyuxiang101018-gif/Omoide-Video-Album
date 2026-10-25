@@ -1,0 +1,18 @@
+[
+  {
+    "file": "dlog_sdr.cube",
+    "official_name": "DJI OSMO Pocket 4P D-Log to Rec.709 V2.0 size33.cube",
+    "sha256": "04757dd8dd669d60a2d58ea1834f185616ca9952922c168fe69dba29bb2be1b1",
+    "purpose": "SDR Rec.709",
+    "source": "https://repair.dji.com/help/content?customId=01700007105&lang=zh-CN&paperDocType=ARTICLE&re=CN&spaceId=17",
+    "obtained": "2026-09-27"
+  },
+  {
+    "file": "dlog2_sdr.cube",
+    "official_name": "DJI OSMO Pocket 4P D-Log2 to Rec.709 V1.0 size33.cube",
+    "sha256": "ca19fb2da9ddb82261a6baa86a511ce22bb46a1d6ca5bf50ca4c4dbbd71eb1a1",
+    "purpose": "SDR Rec.709",
+    "source": "https://repair.dji.com/help/content?customId=01700007105&lang=zh-CN&paperDocType=ARTICLE&re=CN&spaceId=17",
+    "obtained": "2026-09-27"
+  }
+]

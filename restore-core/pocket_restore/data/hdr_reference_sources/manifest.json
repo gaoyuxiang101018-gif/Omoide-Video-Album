@@ -1,0 +1,59 @@
+{
+  "verified_date": "2026-10-02",
+  "official_dji_download_page": "https://www.dji.com/downloads/softwares/aces-workflow-dlog-2",
+  "dlog2_zip": {
+    "url": "https://terra-1-g.djicdn.com/851d20f7b9f64838a34cd02351370894/ACES%20D-Log%202/aces_workflow-dlog-2.zip",
+    "sha256": "fcc0c94f58c6488bcca609ff7444f1476a98dc68282e8a70adbc688fae7c4369",
+    "listed_release_date": "2026-06-30"
+  },
+  "dlog_zip": {
+    "url": "https://terra-1-g.djicdn.com/851d20f7b9f64838a34cd02351370894/ACES/ACES%20Workflow%20Guide%20.zip",
+    "sha256": "76473cdcd09c61f1f16ca99216a97b9dc7a60765b66c5a239906869978f60fb8"
+  },
+  "files": [
+    {
+      "file": "Dlog2_DGamut2_to_ACES_AP0_cat02.ctl",
+      "sha256": "f4d38708eb7f1886e27dcc09f4d358f8ef8dbf986706fd0bb7fc2a90b76a90ff",
+      "profile": "dlog2"
+    },
+    {
+      "file": "DLog2_DGamut2_to_ACES_AP0_cat02.dctl",
+      "sha256": "c0f4d7e7854fcb86df4d330d9ddb1e84fc9c22378cd49c61033f3ca0db4f47e5",
+      "profile": "dlog2"
+    },
+    {
+      "file": "Dlog_DGamut_to_ACES_AP0_cat02_v1.ctl",
+      "sha256": "3c458224c3df40798fadb1cc438d85f6e6f3a15cd5884224f30676f62a6a5410",
+      "profile": "dlog"
+    },
+    {
+      "file": "DLog_DGamut_to_ACES_AP0_cat02_v1.dctl",
+      "sha256": "51c7dd62ddc834cee506c0683f5e91005d7d7d538d471ab60d02241b44a91f15",
+      "profile": "dlog"
+    }
+  ],
+  "hlg_standard": {
+    "title": "ITU-R BT.2100-3 (02/2025), Table 2 and Table 5",
+    "url": "https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.2100-3-202502-I!!PDF-E.pdf",
+    "sha256": "f0668803dce2cd67e3780efbe97494c776b7d6b680733c8237fee364f2d412c3"
+  },
+  "input_math": "DJI CTL inverse curves and exact published xy primaries, converted directly to BT.2020 D65 without a D60 ACES intermediate.",
+  "output_math": "ITU HLG OETF; at 1000 nits nominal display peak and system gamma 1.2, scene diffuse white 1 maps to 203 nits.",
+  "rendering_choices": {
+    "exposure_ev_default": 0,
+    "reference_white_nits": 203,
+    "nominal_peak_nits": 1000,
+    "shoulder": "Identity through scene luminance 1; above 1, y_out = 1 + w * (1 - exp(-(y-1)/w)), w = scene_peak-1. One RGB multiplier.",
+    "gamut_compression": "A common saturation factor toward the BT.2020 grey axis ensures all channels fit the peak while preserving mapped luminance and hue direction.",
+    "mimo_equivalence": false
+  },
+  "encoding_contract": {
+    "primaries": "bt2020",
+    "transfer": "arib-std-b67",
+    "matrix": "bt2020nc",
+    "bits": 10,
+    "lut_domain": "Full-range normalized RGB [0,1]",
+    "interpolation": "tetrahedral recommended",
+    "extra_gamma": "Do not apply."
+  }
+}

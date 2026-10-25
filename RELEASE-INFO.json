@@ -1,0 +1,26 @@
+{
+  "version": "v0.7.5-zh.20261025",
+  "built_at": "2026-10-25T10:00:33.666821+00:00",
+  "upstream": {
+    "version": "0.7.5-zh.20261025",
+    "upstream": "https://github.com/EinAeffchen/Omoide",
+    "upstream_commit": "59dd2db769fd88d454b5479c5b0207989337363f",
+    "installed_executable_sha256": "10a05481b9b3a40737e58cf2d8cf313b0cc570b646d79a1b5a6a16ba969de60d",
+    "published_native_changes": [
+      "restoration cache accepts the launcher storage directory"
+    ],
+    "private_library_included": false,
+    "pretrained_weights_included": false
+  },
+  "native_sha256": "0636d7c7b001387431b80eaaae0ec8da893934564424e451ca1f0c1f220a0c7d",
+  "launcher_sha256": "d9241800a2405914bc000b65bfb973d4d2babd848c577550fe11e76541af48d9",
+  "checks": {
+    "frontal": 18,
+    "prior_backend": 72,
+    "frontend": 84,
+    "launcher": 8
+  },
+  "gui_visual_verification": false,
+  "personal_library_included": false,
+  "pretrained_face_models_included": false
+}

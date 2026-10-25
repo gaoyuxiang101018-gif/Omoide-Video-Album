@@ -1,0 +1,415 @@
+import { withMediaCacheScope } from "../urlUtils";
+import { useState } from "react";
+import {
+  Alert,
+  Box,
+  Button,
+  Checkbox,
+  CircularProgress,
+  Divider,
+  Paper,
+  Snackbar,
+  Stack,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tooltip,
+  Typography,
+} from "@mui/material";
+import DeleteIcon from "@mui/icons-material/Delete";
+import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
+import BlockIcon from "@mui/icons-material/Block";
+import SelectAllIcon from "@mui/icons-material/SelectAll";
+import ClearAllIcon from "@mui/icons-material/ClearAll";
+import ReplayIcon from "@mui/icons-material/Replay";
+
+import { BrokenMediaItem } from "../types";
+import { API } from "../config";
+import { encodeFilePath } from "../urlUtils";
+import { getBrokenMedia, resolveBroken, retryBroken } from "../services/broken";
+import { usePagedList } from "../hooks/usePagedList";
+import { useIdSelection } from "../hooks/useIdSelection";
+import ConfirmDialog from "../components/ConfirmDialog";
+import { resolveConfirmCopy, BulkResolveAction, FeedbackSeverity } from "../components/BulkResolveToolbar";
+import { formatBytes } from "../formatUtils";
+
+const buildThumbUrl = (item: BrokenMediaItem) =>
+  withMediaCacheScope(`${API}/thumbnails/${item.thumbnail_path ? encodeFilePath(item.thumbnail_path) : `${item.id}.jpg`}`);
+
+const BrokenMediaPage: React.FC = () => {
+  const list = usePagedList<BrokenMediaItem>(
+    "broken-media",
+    (cursor, signal) => getBrokenMedia({ cursor }, signal),
+    { infiniteScroll: false, refetchOnMount: true }
+  );
+  const { items, isLoading, error, hasMore, loadMore } = list;
+  const total = list.total ?? 0;
+  const selection = useIdSelection<number>();
+  const { selectedIds, toggle: toggleSelection, clear: clearSelection } = selection;
+  const [isActionLoading, setIsActionLoading] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{
+    action: BulkResolveAction;
+    selectAll: boolean;
+  } | null>(null);
+  const [snackbar, setSnackbar] = useState<{
+    open: boolean;
+    message: string;
+    severity: FeedbackSeverity;
+  }>({ open: false, message: "", severity: "success" });
+
+  const reload = () => {
+    clearSelection();
+    list.reload();
+  };
+
+  const selectAllVisible = () => selection.selectAll(items.map((i) => i.id));
+
+  const removeLocalItems = (ids: number[], removed: number) => {
+    list.removeItems(ids, removed);
+    selection.deselect(ids);
+  };
+
+  const requestAction = (action: BulkResolveAction, selectAll = false) => {
+    if ((selectAll ? total : selectedIds.size) === 0) return;
+    setPendingAction({ action, selectAll });
+  };
+
+  const handleConfirmAction = async () => {
+    if (!pendingAction) return;
+    const ids = pendingAction.selectAll ? [] : Array.from(selectedIds);
+    setIsActionLoading(true);
+    try {
+      const payload = pendingAction.selectAll
+        ? { select_all: true, action: pendingAction.action }
+        : { media_ids: ids, action: pendingAction.action };
+      const result = await resolveBroken(payload);
+      setSnackbar({
+        open: true,
+        message: result.removed > 0 ? ("已处理 {0} 个项目".replace(/\{(\d+)\}/g, (_, i) => String([result.removed][Number(i)]))) : "没有匹配的项目",
+        severity: result.removed > 0 ? "success" : "warning",
+      });
+      if (pendingAction.selectAll) {
+        reload();
+      } else if (result.removed > 0) {
+        removeLocalItems(ids, result.removed);
+      }
+      setPendingAction(null);
+    } catch (err) {
+      setSnackbar({
+        open: true,
+        message: err instanceof Error ? err.message : "操作失败",
+        severity: "error",
+      });
+      setPendingAction(null);
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const handleRetry = async (selectAll = false) => {
+    const count = selectAll ? total : selectedIds.size;
+    if (count === 0) return;
+
+    setIsActionLoading(true);
+    try {
+      const payload = selectAll
+        ? { select_all: true }
+        : { media_ids: Array.from(selectedIds) };
+      // The server retries at most a small batch per call and reports how many
+      // matching items are left; keep going while batches still recover items.
+      let retried = 0;
+      let cleared = 0;
+      let stillBroken = 0;
+      for (;;) {
+        const result = await retryBroken(payload);
+        retried += result.retried;
+        cleared += result.cleared;
+        stillBroken += result.still_broken;
+        if (!result.remaining || result.cleared === 0) break;
+      }
+      setSnackbar({
+        open: true,
+        message: ("已重试 {0} 个项目：{1} 个已恢复，{2} 个仍损坏".replace(/\{(\d+)\}/g, (_, i) => String([retried, cleared, stillBroken][Number(i)]))),
+        severity: cleared > 0 ? "success" : "warning",
+      });
+      reload();
+    } catch (err) {
+      setSnackbar({
+        open: true,
+        message: err instanceof Error ? err.message : "重试失败",
+        severity: "error",
+      });
+    } finally {
+      setIsActionLoading(false);
+    }
+  };
+
+  const selectedCount = selectedIds.size;
+  const allVisibleSelected = items.length > 0 && selectedCount === items.length;
+  const pendingCopy = pendingAction
+    ? resolveConfirmCopy(pendingAction.action, pendingAction.selectAll ? total : selectedCount)
+    : null;
+
+  return (
+    <Box sx={{ p: 3, maxWidth: "1400px", mx: "auto" }}>
+      <Typography variant="h4" gutterBottom>
+        {" 损坏的媒体 "}</Typography>
+      <Typography variant="body1" color="text.secondary" sx={{ mb: 2 }}>
+        {" 这些文件无法处理——无法提取帧，导致无法搜索。请查看错误，然后删除或将其加入黑名单。 "}</Typography>
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
+
+      <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={2}
+          alignItems={{ xs: "flex-start", sm: "center" }}
+          justifyContent="space-between"
+        >
+          <Typography variant="h6">{total} {" 个处理出错的文件"}</Typography>
+          <Stack direction="row" spacing={1}>
+            <Button
+              size="small"
+              startIcon={<SelectAllIcon />}
+              onClick={selectAllVisible}
+              disabled={items.length === 0}
+            >
+              {" 选择可见项 "}</Button>
+            <Button
+              size="small"
+              startIcon={<ClearAllIcon />}
+              onClick={clearSelection}
+              disabled={selectedCount === 0}
+            >
+              {" 清除选择 "}</Button>
+          </Stack>
+        </Stack>
+      </Paper>
+
+      <Paper variant="outlined" sx={{ mb: 3 }}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1}
+          alignItems={{ xs: "stretch", sm: "center" }}
+          justifyContent="space-between"
+          sx={{ p: 2 }}
+        >
+          <Typography variant="subtitle1">
+            {" 已选择： "}{selectedCount} / {items.length}
+          </Typography>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} flexWrap="wrap">
+            <Tooltip title="移除数据库记录但保留磁盘上的文件">
+              <span>
+                <Button
+                  variant="outlined"
+                  startIcon={<DeleteIcon />}
+                  onClick={() => requestAction("DELETE_RECORDS")}
+                  disabled={selectedCount === 0 || isActionLoading}
+                >
+                  {" 移除记录 "}</Button>
+              </span>
+            </Tooltip>
+            <Tooltip title="从磁盘删除文件并移除数据库记录">
+              <span>
+                <Button
+                  variant="outlined"
+                  color="error"
+                  startIcon={<DeleteForeverIcon />}
+                  onClick={() => requestAction("DELETE_FILES")}
+                  disabled={selectedCount === 0 || isActionLoading}
+                >
+                  {" 删除文件 "}</Button>
+              </span>
+            </Tooltip>
+            <Tooltip title="将该路径加入黑名单使其不再被重新导入，并移除数据库记录">
+              <span>
+                <Button
+                  variant="contained"
+                  color="error"
+                  startIcon={<BlockIcon />}
+                  onClick={() => requestAction("BLACKLIST_RECORDS")}
+                  disabled={selectedCount === 0 || isActionLoading}
+                >
+                  {" 加入黑名单 "}</Button>
+              </span>
+            </Tooltip>
+            <Tooltip title="重新尝试生成缩略图；成功后将清除错误并重新排队处理">
+              <span>
+                <Button
+                  variant="outlined"
+                  color="primary"
+                  startIcon={<ReplayIcon />}
+                  onClick={() => handleRetry()}
+                  disabled={selectedCount === 0 || isActionLoading}
+                >
+                  {" 重试 "}</Button>
+              </span>
+            </Tooltip>
+            {total > 0 && (
+              <>
+                <Divider flexItem orientation="vertical" sx={{ display: { xs: "none", sm: "block" } }} />
+                <Button
+                  variant="text"
+                  color="error"
+                  startIcon={<BlockIcon />}
+                  onClick={() => requestAction("BLACKLIST_RECORDS", true)}
+                  disabled={isActionLoading}
+                >
+                  {" 全部加入黑名单 "}</Button>
+                <Button
+                  variant="text"
+                  color="primary"
+                  startIcon={<ReplayIcon />}
+                  onClick={() => handleRetry(true)}
+                  disabled={isActionLoading}
+                >
+                  {" 全部重试 "}</Button>
+              </>
+            )}
+          </Stack>
+        </Stack>
+
+        <Divider />
+
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell padding="checkbox">
+                  <Checkbox
+                    indeterminate={selectedCount > 0 && !allVisibleSelected}
+                    checked={allVisibleSelected}
+                    onChange={() =>
+                      allVisibleSelected ? clearSelection() : selectAllVisible()
+                    }
+                  />
+                </TableCell>
+                <TableCell>{"预览"}</TableCell>
+                <TableCell>{"文件"}</TableCell>
+                <TableCell>{"文件夹"}</TableCell>
+                <TableCell align="right">{"大小"}</TableCell>
+                <TableCell>{"错误"}</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {items.map((item) => {
+                const selected = selectedIds.has(item.id);
+                return (
+                  <TableRow key={item.id} hover selected={selected}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selected}
+                        onChange={() => toggleSelection(item.id)}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Box
+                        sx={{
+                          width: 56,
+                          height: 56,
+                          borderRadius: 1,
+                          overflow: "hidden",
+                          bgcolor: "action.hover",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                        }}
+                      >
+                        <Box
+                          component="img"
+                          src={buildThumbUrl(item)}
+                          alt={item.filename}
+                          loading="lazy"
+                          sx={{
+                            width: "100%",
+                            height: "100%",
+                            objectFit: "cover",
+                            display: "block",
+                          }}
+                          onError={(e) => {
+                            e.currentTarget.style.visibility = "hidden";
+                          }}
+                        />
+                      </Box>
+                    </TableCell>
+                    <TableCell sx={{ fontFamily: "monospace" }}>
+                      {item.filename}
+                    </TableCell>
+                    <TableCell sx={{ fontFamily: "monospace" }}>
+                      {item.parent_directory}
+                    </TableCell>
+                    <TableCell align="right">{formatBytes(item.size)}</TableCell>
+                    <TableCell
+                      sx={{
+                        maxWidth: 400,
+                        color: "error.main",
+                        fontFamily: "monospace",
+                        fontSize: "0.75rem",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {item.processing_error}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+              {!isLoading && items.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={6} align="center" sx={{ py: 4 }}>
+                    {" 未发现损坏的媒体。所有文件处理成功。 "}</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+
+        {isLoading && (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
+            <CircularProgress size={24} />
+          </Box>
+        )}
+        {!isLoading && hasMore && items.length > 0 && (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+            <Button onClick={loadMore}>
+              {" 加载更多 "}</Button>
+          </Box>
+        )}
+      </Paper>
+
+      <ConfirmDialog
+        open={Boolean(pendingAction)}
+        title={pendingCopy?.title ?? ""}
+        message={pendingCopy?.message ?? ""}
+        confirmLabel={pendingCopy?.confirmLabel}
+        loading={isActionLoading}
+        onConfirm={handleConfirmAction}
+        onClose={() => setPendingAction(null)}
+      />
+
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={5000}
+        onClose={() => setSnackbar((p) => ({ ...p, open: false }))}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert
+          onClose={() => setSnackbar((p) => ({ ...p, open: false }))}
+          severity={snackbar.severity}
+          sx={{ width: "100%" }}
+        >
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
+    </Box>
+  );
+};
+
+export default BrokenMediaPage;

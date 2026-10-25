@@ -1,0 +1,814 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useLocation } from "react-router-dom";
+import { getPerson, getPersonMediaAppearances } from "../services/person";
+import {
+  autoMergeSimilarPersons,
+  deletePerson as deletePersonService,
+  detachMediaFromPerson,
+  getPersonFaces,
+  getSimilarPersons,
+  getPersonRelationshipGraph,
+  getSuggestedFaces,
+  mergeMultiplePersons,
+  mergePersons,
+  searchPersonsByName,
+  setProfileFace,
+  autoSelectProfileFace as requestAutoSelectProfileFace,
+  updatePerson,
+} from "../services/personActions";
+import { getConfig } from "../services/config";
+import appConfig from "../config";
+import type { MergeResult } from "../services/personActions";
+import { useListStore } from "../stores/useListStore";
+import { usePagedList } from "./usePagedList";
+import {
+  FacesSortBy,
+  FaceRead,
+  Media,
+  Person,
+  PersonReadSimple,
+  PersonRelationshipGraph,
+  SimilarPerson,
+  SimilarPersonWithDetails,
+  Tag,
+} from "../types";
+import {
+  assignFace,
+  createPersonFromFaces,
+  deleteFace,
+  detachFace,
+} from "../services/faceActions";
+import {
+  useLocalStorageNumber,
+  useLocalStoragePreference,
+} from "./useLocalStoragePreference";
+
+export const usePersonDetailPage = () => {
+  const { id } = useParams<{ id: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const [person, setPerson] = useState<Person | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState({ name: "" });
+  const [saving, setSaving] = useState(false);
+  const [isAutoSelectingProfile, setIsAutoSelectingProfile] = useState(false);
+  const [isMergingSimilar, setIsMergingSimilar] = useState(false);
+
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [mergeTarget, setMergeTarget] = useState<{
+    id: number;
+    name: string;
+  } | null>(null);
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const [candidates, setCandidates] = useState<Person[]>([]);
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState(searchTerm);
+  const [similarPersons, setSimilarPersons] = useState<SimilarPerson[]>([]);
+  const [suggestedFaces, setSuggestedFaces] = useState<FaceRead[]>([]);
+  const [isLoadingSuggestedFaces, setIsLoadingSuggestedFaces] =
+    useState(false);
+  const [suggestedFacesLimit, setSuggestedFacesLimit] = useLocalStorageNumber(
+    "personSuggestedFacesLimit",
+    100,
+    { min: 10, max: 300 }
+  );
+  const suggestedFacesLimitRef = useRef(suggestedFacesLimit);
+  suggestedFacesLimitRef.current = suggestedFacesLimit;
+  const handleSuggestedFacesLimitChange = useCallback((limit: number) => {
+    suggestedFacesLimitRef.current = limit;
+    setSuggestedFacesLimit(limit);
+  }, [setSuggestedFacesLimit]);
+  const [relationshipGraph, setRelationshipGraph] =
+    useState<PersonRelationshipGraph | null>(null);
+  const [relationshipDepth, setRelationshipDepth] = useState(3);
+  const [isLoadingRelationships, setIsLoadingRelationships] = useState(false);
+  const [hasLoadedRelationships, setHasLoadedRelationships] = useState(false);
+  const [relationshipMaxNodes, setRelationshipMaxNodes] = useState<number>(() => {
+    const initial = appConfig.PERSON_RELATIONSHIP_MAX_NODES;
+    return Number.isFinite(initial) && initial > 0 ? initial : 100;
+  });
+  const [canExportMedia, setCanExportMedia] = useState(false);
+
+  const [filterPeople, setFilterPeople] = useState<PersonReadSimple[]>([]);
+  const [filterTags, setFilterTags] = useState<Tag[]>([]);
+
+  const mediaListKey = useMemo(() => {
+    const filterIds = filterPeople
+      .map((p) => p.id)
+      .sort()
+      .join(",");
+    const tagString = filterTags
+      .map((tag) => tag.name)
+      .sort()
+      .join(",");
+    const tagKey = tagString ? `-tags:${tagString}` : "";
+    return `person-${id}-media-appearances-${filterIds}${tagKey}`;
+  }, [id, filterPeople, filterTags]);
+
+  const [facesSortBy, setFacesSortBy] = useLocalStoragePreference(
+    "personFacesSortBy",
+    ["id_desc", "date_desc", "date_asc"] as readonly FacesSortBy[],
+    "id_desc"
+  );
+  const facesSortByRef = useRef(facesSortBy);
+  facesSortByRef.current = facesSortBy;
+
+  const detectedFacesListKey = useMemo(
+    () => (id ? `/api/person/${id}/faces` : ""),
+    [id],
+  );
+
+  const clearList = useListStore((state) => state.clearList);
+
+  // DetectedFaces drives "load more" itself, so no infinite-scroll sentinel.
+  const {
+    items: detectedFacesList,
+    hasMore: hasMoreFaces,
+    isLoading: loadingMoreFaces,
+    loadMore: loadMoreFaces,
+    reload: reloadDetectedFaces,
+    removeItems: removeDetectedFaces,
+  } = usePagedList<FaceRead>(
+    detectedFacesListKey,
+    (cursor, signal) =>
+      getPersonFaces(
+        Number(id),
+        cursor,
+        20,
+        facesSortByRef.current,
+        undefined,
+        signal,
+      ),
+    { enabled: Boolean(id), infiniteScroll: false },
+  );
+
+  // MediaAppearances renders (and scrolls) this list under the same key; it is
+  // loaded here as well so mutations can refresh it while another tab is open.
+  const { reload: reloadMediaAppearances } = usePagedList<Media>(
+    mediaListKey,
+    (cursor, signal) =>
+      getPersonMediaAppearances(
+        Number(id),
+        cursor ?? undefined,
+        filterPeople.map((p) => p.id),
+        filterTags.map((tag) => tag.name),
+        signal,
+      ),
+    { enabled: Boolean(id), infiniteScroll: false },
+  );
+
+  const refreshDetectedFaces = useCallback(async () => {
+    if (!id || !detectedFacesListKey) return;
+    reloadDetectedFaces();
+  }, [id, detectedFacesListKey, reloadDetectedFaces]);
+
+  const refreshMediaAppearances = useCallback(async () => {
+    if (!id || !mediaListKey) return;
+    reloadMediaAppearances();
+  }, [id, mediaListKey, reloadMediaAppearances]);
+
+  // These lists were always refetched when the page (or the media filters)
+  // changed. A list that is cached from an earlier visit is reloaded; one
+  // whose first page is already loading is fresh and left alone.
+  // Successful edits and completed recognition jobs invalidate these lists
+  // centrally. Back navigation can retain already loaded faces and media.
+
+  const [snackbar, setSnackbar] = useState<{
+    open: boolean;
+    message: string;
+    severity: "success" | "error" | "info";
+  }>({ open: false, message: "", severity: "success" });
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const showMessage = useCallback(
+    (message: string, severity: "success" | "error" = "success") => {
+      setSnackbar({ open: true, message, severity });
+    },
+    [],
+  );
+
+  const loadDetail = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!id) return;
+      try {
+        const personData = await getPerson(id, signal);
+        setPerson(personData);
+        setForm({
+          name: personData.name ?? "",
+        });
+      } catch (err) {
+        if (signal?.aborted !== true) {
+          console.error("Error in loadDetail:", err);
+        }
+      }
+    },
+    [id],
+  );
+
+  const loadMoreDetectedFaces = useCallback(() => {
+    if (!id) return;
+    loadMoreFaces();
+  }, [id, loadMoreFaces]);
+
+  const fetchFacesForMedia = useCallback(
+    async (mediaId: number): Promise<FaceRead[]> => {
+      if (!id) return [];
+      const result = await getPersonFaces(Number(id), null, 50, "id_desc", mediaId);
+      return result.items ?? [];
+    },
+    [id],
+  );
+
+  const handleFacesSortChange = useCallback(
+    async (sort: FacesSortBy) => {
+      if (!id) return;
+      setFacesSortBy(sort);
+      // The fetcher reads the ref, so the reload uses the new order.
+      facesSortByRef.current = sort;
+      reloadDetectedFaces();
+    },
+    [id, reloadDetectedFaces, setFacesSortBy],
+  );
+
+  const fetchSuggestedFaces = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!id) return;
+      setIsLoadingSuggestedFaces(true);
+      try {
+        const data = await getSuggestedFaces(Number(id), suggestedFacesLimitRef.current, signal);
+        if (signal?.aborted) {
+          return;
+        }
+        setSuggestedFaces(Array.isArray(data) ? data : []);
+      } catch (err) {
+        if (signal?.aborted !== true) {
+          console.error("Error loading suggested faces:", err);
+        }
+      } finally {
+        if (signal?.aborted !== true) {
+          setIsLoadingSuggestedFaces(false);
+        }
+      }
+    },
+    [id],
+  );
+
+  const refreshSuggestedFaces = useCallback(
+    () => fetchSuggestedFaces(),
+    [fetchSuggestedFaces],
+  );
+
+  const loadSimilar = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!id) return;
+      setSimilarPersons([]);
+      try {
+        const data: SimilarPersonWithDetails[] = await getSimilarPersons(
+          Number(id),
+          signal,
+        );
+        setSimilarPersons(data);
+      } catch (error) {
+        if (signal?.aborted !== true) {
+          console.error("Error loading similarities:", error);
+        }
+      }
+    },
+    [id],
+  );
+
+  const loadRelationshipGraph = useCallback(
+    async (targetDepth?: number, signal?: AbortSignal) => {
+      if (!id) return;
+      const depthToRequest = targetDepth ?? relationshipDepth;
+      setIsLoadingRelationships(true);
+      try {
+        const graph = await getPersonRelationshipGraph(
+          Number(id),
+          depthToRequest,
+          relationshipMaxNodes,
+          signal,
+        );
+        setRelationshipGraph(graph);
+        setRelationshipDepth(depthToRequest);
+        setHasLoadedRelationships(true);
+      } catch (error) {
+        if (signal?.aborted !== true) {
+          console.error("Error loading relationship graph:", error);
+        }
+      } finally {
+        if (signal?.aborted !== true) {
+          setIsLoadingRelationships(false);
+        }
+      }
+    },
+    [id, relationshipDepth, relationshipMaxNodes],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncMaxNodes = async () => {
+      try {
+        const cfg = await getConfig();
+        if (cancelled) {
+          return;
+        }
+        const value = cfg.general.person_relationship_max_nodes ?? 100;
+        if (Number.isFinite(value) && value > 0) {
+          setRelationshipMaxNodes(value);
+        }
+        setCanExportMedia(
+          !cfg.general.is_docker && !cfg.general.presentation_mode,
+        );
+      } catch (err) {
+        if (!cancelled && import.meta.env.DEV) {
+          console.warn("Failed to load relationship graph settings", err);
+        }
+      }
+    };
+
+    void syncMaxNodes();
+
+    const handleRuntimeConfigUpdate = () => {
+      const raw = window.runtimeConfig?.PERSON_RELATIONSHIP_MAX_NODES;
+      const parsed = raw ? Number(raw) : NaN;
+      if (Number.isFinite(parsed) && parsed > 0) {
+        setRelationshipMaxNodes(parsed);
+      }
+    };
+
+    window.addEventListener("runtime-config-updated", handleRuntimeConfigUpdate);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "runtime-config-updated",
+        handleRuntimeConfigUpdate,
+      );
+    };
+  }, []);
+
+  const reloadRelationshipGraphIfLoaded = useCallback(async () => {
+    if (!id || !hasLoadedRelationships) {
+      return;
+    }
+    try {
+      await loadRelationshipGraph(relationshipDepth);
+    } catch (error) {
+      console.error("Failed to reload relationship graph:", error);
+    }
+  }, [hasLoadedRelationships, id, loadRelationshipGraph, relationshipDepth]);
+
+  const forceRefresh = Boolean(location.state?.forceRefresh);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    const initialLoad = async () => {
+      if (!id) {
+        setPerson(null);
+        setLoading(false);
+        return;
+      }
+
+      setPerson(null);
+      setSimilarPersons([]);
+      setSuggestedFaces([]);
+
+      setLoading(true);
+
+      if (forceRefresh) {
+        const timelineListKey = `person-${id}-timeline`;
+        clearList(timelineListKey);
+      }
+
+      try {
+        // Suggestions have their own loading state and must not hold up the timeline.
+        void fetchSuggestedFaces(controller.signal);
+        await loadDetail(controller.signal);
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          console.error("Initial load failed:", err);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    void initialLoad();
+
+    return () => {
+      controller.abort();
+    };
+  }, [
+    id,
+    forceRefresh,
+    clearList,
+    loadDetail,
+    fetchSuggestedFaces,
+  ]);
+
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearchTerm(searchTerm);
+    }, 500);
+
+    return () => {
+      clearTimeout(handler);
+    };
+  }, [searchTerm]);
+
+  useEffect(() => {
+    setRelationshipGraph(null);
+    setHasLoadedRelationships(false);
+    setRelationshipDepth(3);
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !hasLoadedRelationships) {
+      return;
+    }
+    void reloadRelationshipGraphIfLoaded();
+  }, [
+    id,
+    hasLoadedRelationships,
+    relationshipMaxNodes,
+    reloadRelationshipGraphIfLoaded,
+  ]);
+
+  useEffect(() => {
+    if (!mergeOpen) {
+      setCandidates([]);
+      return;
+    }
+
+    const controller = new AbortController();
+    searchPersonsByName(debouncedSearchTerm, controller.signal)
+      .then((response) => {
+        if (controller.signal.aborted) return;
+        const filtered = response.filter((p: Person) => p.id !== Number(id));
+        setCandidates(filtered);
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          console.error("Search failed:", err);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [debouncedSearchTerm, mergeOpen, id]);
+
+  const handleAssignWrapper = async (
+    faceIds: number[],
+    personId: number,
+    ) => {
+      if (!id) return;
+      try {
+        await assignFace(faceIds, personId);
+        setSuggestedFaces((prev) => prev.filter((f) => !faceIds.includes(f.id)));
+        await Promise.all([
+          refreshDetectedFaces(),
+          loadDetail(),
+          refreshMediaAppearances(),
+          refreshSuggestedFaces(),
+          reloadRelationshipGraphIfLoaded(),
+        ]);
+        showMessage(`Assigned ${faceIds.length} face${faceIds.length === 1 ? "" : "s"}`);
+      } catch (err) {
+        console.error("Failed to assign face:", err);
+        showMessage("分配人脸失败", "error");
+        throw err;
+      }
+  };
+
+  const handleDeleteWrapper = async (faceIds: number[]) => {
+      try {
+        await deleteFace(faceIds);
+        removeDetectedFaces(faceIds);
+        setSuggestedFaces((prev) => prev.filter((f) => !faceIds.includes(f.id)));
+        await Promise.all([
+          refreshMediaAppearances(),
+          loadDetail(),
+          refreshSuggestedFaces(),
+          reloadRelationshipGraphIfLoaded(),
+        ]);
+        showMessage(`Deleted ${faceIds.length} face${faceIds.length === 1 ? "" : "s"}`);
+      } catch (err) {
+        console.error("Failed to delete face:", err);
+        showMessage("删除人脸失败", "error");
+        throw err;
+      }
+  };
+
+  const handleDetachWrapper = async (faceIds: number[]) => {
+      try {
+        await detachFace(faceIds);
+        removeDetectedFaces(faceIds);
+        setSuggestedFaces((prev) => prev.filter((f) => !faceIds.includes(f.id)));
+        await Promise.all([
+          refreshMediaAppearances(),
+          loadDetail(),
+          refreshSuggestedFaces(),
+          reloadRelationshipGraphIfLoaded(),
+        ]);
+        showMessage(`Detached ${faceIds.length} face${faceIds.length === 1 ? "" : "s"}`);
+      } catch (err) {
+        console.error("Failed to detach face:", err);
+        showMessage("分离人脸失败", "error");
+        throw err;
+      }
+  };
+
+  const handleDetachMediaWrapper = async (mediaId: number) => {
+    if (!id) return;
+    try {
+      await detachMediaFromPerson(Number(id), mediaId);
+      await Promise.all([
+        refreshDetectedFaces(),
+        refreshMediaAppearances(),
+        loadDetail(),
+        refreshSuggestedFaces(),
+        reloadRelationshipGraphIfLoaded(),
+      ]);
+      showMessage("已从人物中移除媒体文件");
+    } catch (err) {
+      console.error("Failed to detach media from person:", err);
+      showMessage("从人物中移除媒体文件失败", "error");
+    }
+  };
+
+  const handleCreateWrapper = async (
+    faceIds: number[],
+    name?: string,
+  ): Promise<Person> => {
+    try {
+      const newPerson = await createPersonFromFaces(faceIds, name);
+        setSuggestedFaces((prev) => prev.filter((f) => !faceIds.includes(f.id)));
+        await Promise.all([
+          refreshDetectedFaces(),
+          loadDetail(),
+          refreshMediaAppearances(),
+          refreshSuggestedFaces(),
+          reloadRelationshipGraphIfLoaded(),
+        ]);
+        showMessage("已创建新人物");
+        return newPerson;
+      } catch (err) {
+        console.error("Failed to create person:", err);
+        showMessage("创建人物失败", "error");
+      throw err;
+    }
+  };
+
+  const mergeSelectedSimilar = useCallback(
+    async (sourceIds: number[]): Promise<MergeResult | void> => {
+      if (!id || sourceIds.length === 0) {
+        return;
+      }
+      setIsMergingSimilar(true);
+      try {
+        const result = await mergeMultiplePersons(Number(id), sourceIds);
+        const mergedCount = result.merged_ids.length;
+        if (mergedCount > 0) {
+          const skippedCount = result.skipped_ids.length;
+          const messageParts = [`Merged ${mergedCount} similar person${mergedCount > 1 ? "s" : ""}`];
+          if (skippedCount > 0) {
+            messageParts.push(`skipped ${skippedCount}`);
+          }
+            showMessage(messageParts.join(", "));
+            await Promise.all([
+              loadDetail(),
+              refreshDetectedFaces(),
+              refreshMediaAppearances(),
+              refreshSuggestedFaces(),
+            ]);
+            await loadSimilar();
+            await reloadRelationshipGraphIfLoaded();
+        } else {
+          showMessage("未合并相似人物。", "error");
+        }
+        return result;
+      } catch (err) {
+        console.error("Failed to merge selected similar persons:", err);
+        showMessage("合并所选相似人物失败", "error");
+      } finally {
+        setIsMergingSimilar(false);
+      }
+    },
+      [
+        id,
+        loadDetail,
+        loadSimilar,
+        refreshDetectedFaces,
+        refreshMediaAppearances,
+        refreshSuggestedFaces,
+        reloadRelationshipGraphIfLoaded,
+        showMessage,
+      ]
+  );
+
+  const autoMergeSimilar = useCallback(async (): Promise<MergeResult | void> => {
+    if (!id) return;
+    setIsMergingSimilar(true);
+    try {
+      const result = await autoMergeSimilarPersons(Number(id));
+      const mergedCount = result.merged_ids.length;
+      if (mergedCount > 0) {
+        const skippedCount = result.skipped_ids.length;
+        const messageParts = [`Auto-merged ${mergedCount} similar person${mergedCount > 1 ? "s" : ""}`];
+        if (skippedCount > 0) {
+          messageParts.push(`skipped ${skippedCount}`);
+        }
+          showMessage(messageParts.join(", "));
+          await Promise.all([
+            loadDetail(),
+            refreshDetectedFaces(),
+            refreshMediaAppearances(),
+            refreshSuggestedFaces(),
+          ]);
+        await loadSimilar();
+        await reloadRelationshipGraphIfLoaded();
+      } else {
+        showMessage(
+          "没有相似人物达到自动合并阈值。",
+          "error"
+        );
+      }
+      return result;
+    } catch (err) {
+      console.error("Failed to auto-merge similar persons:", err);
+      showMessage("自动合并相似人物失败", "error");
+    } finally {
+      setIsMergingSimilar(false);
+    }
+  }, [
+    id,
+    loadDetail,
+    loadSimilar,
+    refreshDetectedFaces,
+    refreshMediaAppearances,
+    refreshSuggestedFaces,
+    reloadRelationshipGraphIfLoaded,
+    showMessage,
+  ]);
+
+  const handleAutoSelectProfileFace = useCallback(async () => {
+    if (!id) return;
+    setIsAutoSelectingProfile(true);
+    try {
+      await requestAutoSelectProfileFace(Number(id));
+      await loadDetail();
+      await refreshSuggestedFaces();
+      showMessage("已选择新的人物头像");
+    } catch (err) {
+      console.error("Failed to auto-select profile face:", err);
+      showMessage("自动选择人物头像失败", "error");
+    } finally {
+      setIsAutoSelectingProfile(false);
+    }
+  }, [id, loadDetail, refreshSuggestedFaces, showMessage]);
+
+  const handleProfileAssignmentWrapper = async (
+    faceId: number,
+    personId: number,
+  ) => {
+    try {
+        await setProfileFace(faceId, personId);
+        await loadDetail();
+        await refreshSuggestedFaces();
+        showMessage("人物头像已更新");
+      } catch (err) {
+        console.error("Failed to set profile picture:", err);
+        showMessage("设置人物头像失败", "error");
+      }
+  };
+
+  const handlePersonUpdate = async () => {
+    await loadDetail();
+  };
+
+  const handleDeletePerson = async () => {
+    if (!id) return;
+    try {
+      await deletePersonService(Number(id));
+      showMessage("人物已删除");
+      navigate("/people");
+    } catch (err) {
+      console.error("Failed to delete person:", err);
+      showMessage("删除人物失败", "error");
+    }
+    setConfirmDelete(false);
+  };
+
+  const handleTagAddedToPerson = (newTag: Tag) => {
+    setPerson((prevPerson) => {
+      if (!prevPerson) return null;
+      const updatedTags = [...(prevPerson.tags || []), newTag];
+      return { ...prevPerson, tags: updatedTags };
+    });
+  };
+
+  async function onSave(formDataFromChild: { name: string }) {
+    if (!id) return;
+    setSaving(true);
+    try {
+      await updatePerson(Number(id), { name: formDataFromChild.name });
+      await loadDetail();
+      showMessage("保存成功", "success");
+    } catch (err) {
+      console.error(err);
+      showMessage("保存失败", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleConfirmMerge() {
+    if (!id || !mergeTarget) return;
+
+    const sourceId = Number(id);
+    const targetId = mergeTarget.id;
+    clearList(mediaListKey);
+
+    setMergeTarget(null);
+    setMergeOpen(false);
+    try {
+      await mergePersons(sourceId, targetId);
+      navigate(`/person/${targetId}`, {
+        replace: true,
+        state: {
+          forceRefresh: true,
+        },
+      });
+    } catch (error) {
+      console.error("Merge failed:", error);
+      showMessage("合并失败", "error");
+    }
+  }
+
+  return {
+    id,
+    person,
+    loading,
+    form,
+    saving,
+    mergeOpen,
+    setMergeOpen,
+    mergeTarget,
+    setMergeTarget,
+    searchTerm,
+    setSearchTerm,
+    candidates,
+    similarPersons,
+    suggestedFaces,
+    relationshipGraph,
+    canExportMedia,
+    relationshipDepth,
+    isLoadingRelationships,
+    hasLoadedRelationships,
+    filterPeople,
+    setFilterPeople,
+    filterTags,
+    setFilterTags,
+    mediaListKey,
+    detectedFacesList,
+    hasMoreFaces,
+    loadingMoreFaces,
+    snackbar,
+    setSnackbar,
+    confirmDelete,
+    setConfirmDelete,
+    loadMoreDetectedFaces,
+    refreshSuggestedFaces,
+    loadSimilar,
+    loadRelationshipGraph,
+    handleAssignWrapper,
+    handleDeleteWrapper,
+    handleDetachWrapper,
+    handleDetachMediaWrapper,
+    handleCreateWrapper,
+    facesSortBy,
+    handleFacesSortChange,
+    fetchFacesForMedia,
+    mergeSelectedSimilar,
+    autoMergeSimilar,
+    isMergingSimilar,
+    handleAutoSelectProfileFace,
+    handleProfileAssignmentWrapper,
+    handlePersonUpdate,
+    handleDeletePerson,
+    handleTagAddedToPerson,
+    onSave,
+    handleConfirmMerge,
+    isAutoSelectingProfile,
+    isLoadingSuggestedFaces,
+    suggestedFacesLimit,
+    setSuggestedFacesLimit: handleSuggestedFacesLimitChange,
+  };
+};
